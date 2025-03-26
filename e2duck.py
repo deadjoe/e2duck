@@ -483,7 +483,9 @@ class ExcelToDuckDB:
                             
                             try:
                                 # 使用COPY语句导入数据
-                                self.conn.execute(f"COPY \"{temp_table_name}\" FROM '{temp_csv}' (AUTO_DETECT TRUE)")
+                                self.conn.execute(fr'''
+                                    COPY "{temp_table_name}" FROM '{temp_csv}' (AUTO_DETECT TRUE)
+                                ''')
                                 
                                 # 导入成功后删除临时文件
                                 if os.path.exists(temp_csv):
@@ -1162,7 +1164,7 @@ class ExcelToDuckDB:
                                     logging.info(f"成功将表 '{table_name}' 的列 '{col_name}' 优化为 {original_duck_type} 类型")
                                 elif original_duck_type == 'DOUBLE':
                                     # 先验证数据是否都可以转换为浮点数
-                                    self.conn.execute(f'''
+                                    self.conn.execute(fr'''
                                         SELECT COUNT(*) FROM "{table_name}" 
                                         WHERE "{col_name}" IS NOT NULL 
                                         AND "{col_name}" <> '' 
