@@ -21,21 +21,56 @@ A robust and efficient tool for converting Excel files to DuckDB databases with 
 
 ## Installation
 
+### Prerequisites
+
+- Python 3.7 or higher
+- [uv](https://github.com/astral-sh/uv) - Fast Python package installer and resolver
+
+### Installing uv
+
+If you don't have uv installed, you can install it using:
+
+```bash
+# On macOS/Linux using curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# On Windows using PowerShell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Using pip
+pip install uv
+```
+
+### Setting up the project
+
 ```bash
 # Clone the repository
 git clone https://github.com/yourusername/e2duck.git
 cd e2duck
 
-# Create a virtual environment (using uv)
+# Create a virtual environment using uv
 uv venv
 
 # Activate the virtual environment
-source .venv/bin/activate  # On Unix/macOS
-# OR
-.venv\Scripts\activate  # On Windows
+# On macOS/Linux:
+source .venv/bin/activate
+# On Windows:
+.venv\Scripts\activate
 
-# Install dependencies
+# Install dependencies using uv
+uv pip install -r requirements.txt
+
+# Or install dependencies directly
 uv pip install pandas duckdb
+```
+
+### Verifying Installation
+
+To verify that everything is installed correctly:
+
+```bash
+# Make sure you're in the virtual environment
+python -c "import pandas; import duckdb; print('Installation successful!')"
 ```
 
 ## Usage
