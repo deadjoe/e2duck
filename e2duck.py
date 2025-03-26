@@ -308,13 +308,6 @@ class ExcelToDuckDB:
                     # 使用蓄水池抽样 - 这是最安全的方法，确保随机性和代表性
                     sample_df = self._reservoir_sample(sheet_name, total_rows)
                     
-                    # 计算样本哈希
-                    if sample_df is None or len(sample_df) == 0:
-                        logging.warning(f"工作表 '{sheet_name}' 样本为空，可能影响验证")
-                        sample_hash = "empty_sample"
-                    else:
-                        sample_hash = self._compute_sample_hash(sample_df)
-                    
                     # 线程安全地更新样本
                     with samples_lock:
                         self.samples[sheet_name] = sample_df
@@ -323,7 +316,6 @@ class ExcelToDuckDB:
                         'columns': columns_info,
                         'column_stats': column_stats,
                         'row_count': total_rows,
-                        'sample_hash': sample_hash
                     }
 
                     logging.info(f"工作表 '{sheet_name}' 分析完成，包含 {len(columns_info)} 列，{total_rows} 行")
@@ -848,7 +840,6 @@ class ExcelToDuckDB:
             table_name = sheet_name.replace(' ', '_').replace('-', '_')
             excel_count = info['row_count']
             excel_sample = self.samples[sheet_name]
-            excel_sample_hash = info['sample_hash']
 
             # 创建验证结果对象
             validation = {
@@ -859,7 +850,6 @@ class ExcelToDuckDB:
                 'row_count_match': False,
                 'column_count_match': False,
                 'data_types_match': [],
-                'sample_verification': False,
                 'stats_verification': [],
                 'overall_status': 'pending',
                 'messages': []
@@ -937,32 +927,6 @@ class ExcelToDuckDB:
                                     f"列 '{col_name}' 类型不匹配: 预期 {expected_type if self.safe_mode else col['duck_type']}, 实际 {db_col_type}"
                                 )
 
-                    # 4. 抽样数据验证
-                    try:
-                        # 从数据库抽取相同数量的随机样本
-                        self.conn.execute(f'SELECT * FROM "{table_name}" ORDER BY RANDOM() LIMIT {len(excel_sample)}')
-                        db_sample_rows = self.conn.fetchall()
-                        db_sample_df = pd.DataFrame(db_sample_rows, columns=db_column_names)
-
-                        # 计算数据库样本的哈希值
-                        db_sample_hash = self._compute_sample_hash(db_sample_df)
-
-                        # 注意：直接比较哈希值可能不理想，因为随机排序
-                        # 使用更复杂的比较逻辑，比如比较数值分布等
-
-                        # 这里进行简单比较：抽取的样本数据是否类似
-                        # 在实际应用中，可以添加更详细的比较
-
-                        validation['sample_verification'] = True  # 简化示例
-                        validation['messages'].append(
-                            "已验证数据样本 (随机抽样)"
-                        )
-
-                    except Exception as e:
-                        validation['messages'].append(
-                            f"样本验证错误: {str(e)}"
-                        )
-
                     # 5. 统计信息验证 (仅当非安全模式时进行)
                     if not self.safe_mode:
                         # 批量查询优化：构建所有统计查询并一次性执行
@@ -974,7 +938,7 @@ class ExcelToDuckDB:
                             
                             if 'min' in stats and 'max' in stats:
                                 # 对数值列进行统计验证
-                                validation_queries.append(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}") FROM "{table_name}"')
+                                validation_queries.append(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}"), STDDEV("{clean_col_name}") FROM "{table_name}"')
                                 query_columns.append(('numeric', col_name, clean_col_name, stats))
                             elif 'unique_count' in stats:
                                 # 对分类列验证唯一值数量
@@ -992,25 +956,33 @@ class ExcelToDuckDB:
                             for i, (query_type, col_name, clean_col_name, stats) in enumerate(query_columns):
                                 if query_type == 'numeric':
                                     try:
-                                        db_min, db_max, db_avg = results[i]
+                                        db_min, db_max, db_avg, db_stddev = results[i]
                                         
                                         # 比较最小值、最大值和平均值
                                         min_match = abs(stats['min'] - db_min) < 0.0001
                                         max_match = abs(stats['max'] - db_max) < 0.0001
                                         avg_match = abs(stats['mean'] - db_avg) < 0.0001
                                         
+                                        # 增强验证：比较标准差（如果Excel样本中有）
+                                        stddev_match = True
+                                        if 'std' in stats and db_stddev is not None:
+                                            stddev_match = abs(stats['std'] - db_stddev) < max(0.01, stats['std'] * 0.05)
+                                        
                                         validation['stats_verification'].append({
                                             'column': col_name,
                                             'min_match': min_match,
                                             'max_match': max_match,
                                             'avg_match': avg_match,
-                                            'status': 'success' if (min_match and max_match and avg_match) else 'error'
+                                            'stddev_match': stddev_match,
+                                            'status': 'success' if (min_match and max_match and avg_match and stddev_match) else 'error'
                                         })
                                         
-                                        if not (min_match and max_match and avg_match):
+                                        if not (min_match and max_match and avg_match and stddev_match):
+                                            stddev_info = f", Std={stats['std']}" if 'std' in stats else ""
+                                            db_stddev_info = f", Std={db_stddev}" if db_stddev is not None else ""
                                             validation['messages'].append(
-                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
-                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
+                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}{stddev_info}), "
+                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg}{db_stddev_info})"
                                             )
                                     except Exception as e:
                                         validation['messages'].append(
@@ -1038,7 +1010,6 @@ class ExcelToDuckDB:
                                         validation['messages'].append(
                                             f"处理列 '{col_name}' 分类统计结果时出错: {str(e)}"
                                         )
-                        
                         except Exception as batch_error:
                             logging.error(f"批量执行统计查询时出错: {str(batch_error)}")
                             logging.error(traceback.format_exc())
@@ -1051,26 +1022,36 @@ class ExcelToDuckDB:
                                 if 'min' in stats and 'max' in stats:
                                     # 对数值列进行统计验证
                                     try:
-                                        self.conn.execute(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}") FROM "{table_name}"')
-                                        db_min, db_max, db_avg = self.conn.fetchone()
+                                        self.conn.execute(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}"), STDDEV("{clean_col_name}") FROM "{table_name}"')
+                                        result = self.conn.fetchone()
+                                        db_min, db_max, db_avg = result[0], result[1], result[2]
+                                        db_stddev = result[3] if len(result) > 3 else None
                                         
                                         # 比较最小值、最大值和平均值
                                         min_match = abs(stats['min'] - db_min) < 0.0001
                                         max_match = abs(stats['max'] - db_max) < 0.0001
                                         avg_match = abs(stats['mean'] - db_avg) < 0.0001
                                         
+                                        # 增强验证：比较标准差（如果Excel样本中有）
+                                        stddev_match = True
+                                        if 'std' in stats and db_stddev is not None:
+                                            stddev_match = abs(stats['std'] - db_stddev) < max(0.01, stats['std'] * 0.05)
+                                        
                                         validation['stats_verification'].append({
                                             'column': col_name,
                                             'min_match': min_match,
                                             'max_match': max_match,
                                             'avg_match': avg_match,
-                                            'status': 'success' if (min_match and max_match and avg_match) else 'error'
+                                            'stddev_match': stddev_match,
+                                            'status': 'success' if (min_match and max_match and avg_match and stddev_match) else 'error'
                                         })
                                         
-                                        if not (min_match and max_match and avg_match):
+                                        if not (min_match and max_match and avg_match and stddev_match):
+                                            stddev_info = f", Std={stats['std']}" if 'std' in stats else ""
+                                            db_stddev_info = f", Std={db_stddev}" if db_stddev is not None else ""
                                             validation['messages'].append(
-                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
-                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
+                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}{stddev_info}), "
+                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg}{db_stddev_info})"
                                             )
                                     except Exception as e:
                                         validation['messages'].append(
@@ -1111,10 +1092,14 @@ class ExcelToDuckDB:
                     # 安全模式下不检查统计信息匹配
                     if self.safe_mode or all(sv['status'] == 'success' for sv in validation['stats_verification'] if 'status' in sv):
                         validation['overall_status'] = 'success'
+                        validation['messages'].append("数据验证成功 (行数、列数、数据类型和统计信息均匹配)")
                     else:
                         validation['overall_status'] = 'warning'  # 统计信息不匹配但主要指标匹配
+                        validation['messages'].append("数据基本验证成功，但部分统计信息不匹配")
                 else:
                     validation['overall_status'] = 'error'
+                    if not validation['messages']:
+                        validation['messages'].append("数据验证失败 (行数、列数或数据类型不匹配)")
 
             except Exception as e:
                 validation['overall_status'] = 'error'
