@@ -13,6 +13,13 @@ import psutil  # 用于检测系统内存
 import concurrent.futures
 import threading
 
+# 日志级别标准
+# DEBUG: 详细的开发调试信息，如变量值、中间计算结果等
+# INFO: 正常操作信息，如开始/完成任务、配置信息等
+# WARNING: 潜在问题或需要注意的情况，但不影响主要功能
+# ERROR: 导致功能失败的错误，如文件无法打开、数据处理失败等
+# CRITICAL: 导致程序无法继续运行的严重错误
+
 # 设置日志
 logging.basicConfig(
     filename=f'excel_to_duckdb_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
@@ -20,18 +27,26 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# 定义常量
+DEFAULT_SAMPLE_SIZE = 100  # 默认样本大小
+DEFAULT_BATCH_SIZE = 5000  # 默认批处理大小
+DEFAULT_MEMORY_LIMIT = '4GB'  # 默认内存限制
+MAX_SAMPLE_ROWS = 1000  # 最大样本行数
+MAX_UNIQUE_VALUES = 30  # 最大唯一值数量
+RESERVOIR_BATCH_SIZE = 1000  # 蓄水池抽样批次大小
+
 class ExcelToDuckDB:
-    def __init__(self, excel_path, db_path, sample_size=100, safe_mode=True):
+    def __init__(self, excel_path, db_path, sample_size=DEFAULT_SAMPLE_SIZE, safe_mode=True):
         """
         初始化Excel到DuckDB转换器
         
-        参数:
+        参数：
             excel_path (str): Excel文件的路径
             db_path (str): DuckDB数据库文件的路径
             sample_size (int): 用于验证的样本大小，默认为100
             safe_mode (bool): 是否使用安全模式（所有列使用TEXT类型），默认为True
             
-        异常:
+        异常：
             ValueError: 如果参数无效
             TypeError: 如果参数类型错误
         """
@@ -80,10 +95,10 @@ class ExcelToDuckDB:
         """
         连接到DuckDB数据库
         
-        返回:
+        返回：
             bool: 连接是否成功
             
-        异常:
+        异常：
             不会抛出异常，而是返回False并记录错误
         """
         try:
@@ -111,8 +126,8 @@ class ExcelToDuckDB:
                 logging.info(f"根据系统内存({total_memory:.1f}GB)设置DuckDB内存限制为{memory_limit}")
             except Exception as e:
                 # 如果内存检测失败，使用默认设置
-                self.conn.execute("PRAGMA memory_limit='4GB'")
-                logging.warning(f"内存检测失败，使用默认内存限制4GB: {str(e)}")
+                self.conn.execute(f"PRAGMA memory_limit='{DEFAULT_MEMORY_LIMIT}'")
+                logging.warning(f"内存检测失败，使用默认内存限制{DEFAULT_MEMORY_LIMIT}: {str(e)}")
                 
             # 启用进度条
             self.conn.execute("PRAGMA enable_progress_bar=true")
@@ -130,10 +145,10 @@ class ExcelToDuckDB:
         """
         分析Excel文件结构并提取样本数据用于验证
         
-        返回:
+        返回：
             bool: 分析是否成功
             
-        异常:
+        异常：
             不会抛出异常，而是返回False并记录错误
         """
         try:
@@ -198,14 +213,7 @@ class ExcelToDuckDB:
                     if total_rows is None:
                         try:
                             # 构建参数字典，只在excel_engine不为None时添加engine参数
-                            excel_params = {
-                                'sheet_name': sheet_name,
-                                'usecols': [0],  # 只读取第一列
-                                'header': 0
-                            }
-                            if excel_engine is not None:
-                                excel_params['engine'] = excel_engine
-                                
+                            excel_params = self._build_excel_params(sheet_name, excel_engine, usecols=[0], header=0)
                             df_count = pd.read_excel(
                                 self.excel_path, 
                                 **excel_params
@@ -219,12 +227,7 @@ class ExcelToDuckDB:
                     if total_rows is None:
                         try:
                             # 构建参数字典，只在excel_engine不为None时添加engine参数
-                            excel_params = {
-                                'sheet_name': sheet_name
-                            }
-                            if excel_engine is not None:
-                                excel_params['engine'] = excel_engine
-                                
+                            excel_params = self._build_excel_params(sheet_name, excel_engine)
                             df_count = pd.read_excel(
                                 self.excel_path, 
                                 **excel_params
@@ -236,16 +239,10 @@ class ExcelToDuckDB:
                             return None
                     
                     # 读取样本行进行分析 - 确保读取足够的行
-                    sample_size = min(1000, total_rows)
+                    sample_size = min(MAX_SAMPLE_ROWS, total_rows)
                     
                     # 构建参数字典，只在excel_engine不为None时添加engine参数
-                    excel_params = {
-                        'sheet_name': sheet_name,
-                        'nrows': sample_size
-                    }
-                    if excel_engine is not None:
-                        excel_params['engine'] = excel_engine
-                        
+                    excel_params = self._build_excel_params(sheet_name, excel_engine, nrows=sample_size)
                     df_sample = pd.read_excel(
                         self.excel_path, 
                         **excel_params
@@ -290,8 +287,8 @@ class ExcelToDuckDB:
                                 }
 
                                 # 对小型列收集唯一值，但保留验证所需的信息
-                                if col_data.nunique() < 30:  # 保留更多唯一值
-                                    unique_vals = col_data.dropna().unique().tolist()[:30]
+                                if col_data.nunique() < MAX_UNIQUE_VALUES:  # 保留更多唯一值
+                                    unique_vals = col_data.dropna().unique().tolist()[:MAX_UNIQUE_VALUES]
                                     stats['unique_values'] = [str(val) for val in unique_vals]
 
                         except Exception as e:
@@ -368,34 +365,51 @@ class ExcelToDuckDB:
             logging.error(traceback.format_exc())
             return False
 
-    def import_data(self, batch_size=5000):
+    def import_data(self, batch_size=DEFAULT_BATCH_SIZE):
         """
         将数据从Excel导入到DuckDB，使用批处理以提高性能
         
-        参数:
+        参数：
             batch_size (int): 每批处理的行数，默认为5000
             
-        返回:
+        返回：
             dict: 导入结果
             
-        异常:
+        异常：
             不会抛出异常，而是返回包含错误信息的结果
         """
         # 验证batch_size参数
-        if not isinstance(batch_size, int):
-            logging.error("batch_size必须是整数类型")
-            batch_size = 5000
+        batch_size = self._validate_parameter("batch_size", batch_size, int, min_value=1, default_value=DEFAULT_BATCH_SIZE)
         
-        if batch_size <= 0:
-            logging.error("batch_size必须大于0，使用默认值5000")
-            batch_size = 5000
-        
-        # 对于16GB-64GB内存的机器，可以使用更大的批处理大小
-        # 但仍然设置一个上限以防止内存问题
-        max_batch_size = 100000  # 增加到10万行
-        if batch_size > max_batch_size:
-            logging.warning(f"batch_size ({batch_size}) 过大，可能导致内存问题，已调整为{max_batch_size}")
-            batch_size = max_batch_size
+        # 根据系统内存动态调整批处理大小
+        try:
+            total_memory_gb = psutil.virtual_memory().total / (1024**3)  # 转换为GB
+            
+            # 根据可用内存调整批处理大小
+            if total_memory_gb >= 64:
+                max_batch_size = 200000  # 64GB及以上内存
+            elif total_memory_gb >= 32:
+                max_batch_size = 100000  # 32GB内存
+            elif total_memory_gb >= 16:
+                max_batch_size = 50000   # 16GB内存
+            elif total_memory_gb >= 8:
+                max_batch_size = 20000   # 8GB内存
+            else:
+                max_batch_size = DEFAULT_BATCH_SIZE    # 低内存系统
+                
+            # 如果用户指定的批处理大小小于系统建议值，则使用用户指定的值
+            if batch_size < max_batch_size:
+                logging.info(f"使用用户指定的批处理大小: {batch_size}行")
+            else:
+                # 否则使用系统建议的最大值
+                logging.info(f"根据系统内存({total_memory_gb:.1f}GB)调整批处理大小为{max_batch_size}行")
+                batch_size = max_batch_size
+                
+        except Exception as e:
+            # 如果内存检测失败，使用保守的默认值
+            logging.warning(f"内存检测失败，使用默认批处理大小{DEFAULT_BATCH_SIZE}行: {str(e)}")
+            if batch_size > DEFAULT_BATCH_SIZE:
+                batch_size = DEFAULT_BATCH_SIZE
             
         all_results = {}
 
@@ -437,15 +451,12 @@ class ExcelToDuckDB:
                         logging.info(f"开始导入批次 {i+1}/{num_batches}，从行 {start_row if i > 0 else 1} 开始，计划读取 {nrows} 行")
 
                         # 读取批次数据
+                        excel_params = self._build_excel_params(sheet_name, skiprows=skiprows, nrows=nrows)
                         batch_df = pd.read_excel(
-                            self.excel_path,
-                            sheet_name=sheet_name,
-                            skiprows=skiprows,
-                            nrows=nrows
+                            self.excel_path, 
+                            **excel_params
                         )
-
-                        logging.info(f"成功读取批次 {i+1}/{num_batches}，实际读取 {len(batch_df)} 行")
-
+                        
                         # 清理列名
                         column_mapping = {}
                         for col in info['columns']:
@@ -462,6 +473,8 @@ class ExcelToDuckDB:
                         # 重命名列
                         batch_df = batch_df.rename(columns=column_mapping)
 
+                        logging.info(f"成功读取批次 {i+1}/{num_batches}，实际读取 {len(batch_df)} 行")
+
                         # 使用事务批量处理
                         self.conn.execute("BEGIN TRANSACTION")
 
@@ -470,12 +483,11 @@ class ExcelToDuckDB:
                         import os
                         
                         try:
-                            # 创建临时CSV文件
+                            # 使用上下文管理器创建临时CSV文件并确保正确关闭
                             with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp_file:
                                 temp_csv = temp_file.name
-                            
-                            # 将批次数据保存为CSV
-                            batch_df.to_csv(temp_csv, index=False)
+                                # 将批次数据保存为CSV
+                                batch_df.to_csv(temp_csv, index=False)
                             
                             try:
                                 # 使用COPY语句导入数据
@@ -487,8 +499,40 @@ class ExcelToDuckDB:
                                 
                                 logging.info(f"批次 {i+1}/{num_batches}: 使用COPY语句成功导入数据")
                                 
+                            except duckdb.Error as copy_error:
+                                logging.error(f"DuckDB错误: 使用COPY语句导入失败: {str(copy_error)}")
+                                logging.error(traceback.format_exc())
+                                
+                                # 删除临时文件
+                                if os.path.exists(temp_csv):
+                                    os.remove(temp_csv)
+                                
+                                # 回滚事务
+                                self.conn.execute("ROLLBACK")
+                                
+                                # 重新开始事务
+                                self.conn.execute("BEGIN TRANSACTION")
+                                
+                                # 回退到批量INSERT方式
+                                raise Exception("回退到批量INSERT方式")
+                            except IOError as io_error:
+                                logging.error(f"IO错误: 使用COPY语句导入失败: {str(io_error)}")
+                                logging.error(traceback.format_exc())
+                                
+                                # 删除临时文件
+                                if os.path.exists(temp_csv):
+                                    os.remove(temp_csv)
+                                
+                                # 回滚事务
+                                self.conn.execute("ROLLBACK")
+                                
+                                # 重新开始事务
+                                self.conn.execute("BEGIN TRANSACTION")
+                                
+                                # 回退到批量INSERT方式
+                                raise Exception("回退到批量INSERT方式")
                             except Exception as copy_error:
-                                logging.error(f"使用COPY语句导入失败: {str(copy_error)}")
+                                logging.error(f"其他错误: 使用COPY语句导入失败: {str(copy_error)}")
                                 logging.error(traceback.format_exc())
                                 
                                 # 删除临时文件
@@ -581,8 +625,9 @@ class ExcelToDuckDB:
                         # 回滚事务
                         try:
                             self.conn.execute("ROLLBACK")
-                        except:
-                            pass
+                        except Exception as rollback_error:
+                            logging.error(f"回滚事务失败: {str(rollback_error)}")
+                            logging.error(traceback.format_exc())
 
                         # 记录详细错误信息
                         logging.error(f"导入批次 {i+1}/{num_batches} 到表 '{temp_table_name}' 时出错: {str(batch_error)}")
@@ -642,7 +687,7 @@ class ExcelToDuckDB:
         """
         执行完整的导入过程
         
-        返回:
+        返回：
             dict: 包含处理结果的字典
         """
         overall_start = time.time()
@@ -1027,7 +1072,6 @@ class ExcelToDuckDB:
                                                 f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
                                                 f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
                                             )
-                                            
                                     except Exception as e:
                                         validation['messages'].append(
                                             f"验证列 '{col_name}' 统计信息时出错: {str(e)}"
@@ -1052,7 +1096,6 @@ class ExcelToDuckDB:
                                             validation['messages'].append(
                                                 f"列 '{col_name}' 唯一值数量不匹配: Excel={stats['unique_count']}, DB={db_unique}"
                                             )
-                                            
                                     except Exception as e:
                                         validation['messages'].append(
                                             f"验证列 '{col_name}' 唯一值时出错: {str(e)}"
@@ -1111,6 +1154,19 @@ class ExcelToDuckDB:
                         if original_duck_type != 'TEXT' and not 'VARCHAR' in original_duck_type:
                             try:
                                 if original_duck_type in ('INTEGER', 'BIGINT'):
+                                    # 先验证数据是否都可以转换为整数
+                                    self.conn.execute(f'''
+                                        SELECT COUNT(*) FROM "{table_name}" 
+                                        WHERE "{col_name}" IS NOT NULL 
+                                        AND "{col_name}" <> '' 
+                                        AND "{col_name}" NOT SIMILAR TO '-?[0-9]+'
+                                    ''')
+                                    invalid_count = self.conn.fetchone()[0]
+                                    
+                                    if invalid_count > 0:
+                                        logging.warning(f"列 '{col_name}' 包含 {invalid_count} 行无法转换为整数的数据，保留为TEXT类型")
+                                        continue
+                                        
                                     # 尝试转换为整数
                                     self.conn.execute(f'''
                                         ALTER TABLE "{table_name}"
@@ -1119,8 +1175,20 @@ class ExcelToDuckDB:
                                         USING CAST("{col_name}" AS {original_duck_type})
                                     ''')
                                     logging.info(f"成功将表 '{table_name}' 的列 '{col_name}' 优化为 {original_duck_type} 类型")
-
                                 elif original_duck_type == 'DOUBLE':
+                                    # 先验证数据是否都可以转换为浮点数
+                                    self.conn.execute(f'''
+                                        SELECT COUNT(*) FROM "{table_name}" 
+                                        WHERE "{col_name}" IS NOT NULL 
+                                        AND "{col_name}" <> '' 
+                                        AND "{col_name}" NOT SIMILAR TO '-?[0-9]*\.?[0-9]*([eE][-+]?[0-9]+)?'
+                                    ''')
+                                    invalid_count = self.conn.fetchone()[0]
+                                    
+                                    if invalid_count > 0:
+                                        logging.warning(f"列 '{col_name}' 包含 {invalid_count} 行无法转换为浮点数的数据，保留为TEXT类型")
+                                        continue
+                                    
                                     # 尝试转换为浮点数
                                     self.conn.execute(f'''
                                         ALTER TABLE "{table_name}"
@@ -1129,8 +1197,29 @@ class ExcelToDuckDB:
                                         USING CAST("{col_name}" AS DOUBLE)
                                     ''')
                                     logging.info(f"成功将表 '{table_name}' 的列 '{col_name}' 优化为 DOUBLE 类型")
-
                                 elif original_duck_type in ('DATE', 'TIMESTAMP'):
+                                    # 先验证数据是否都可以转换为日期/时间
+                                    if original_duck_type == 'DATE':
+                                        self.conn.execute(f'''
+                                            SELECT COUNT(*) FROM "{table_name}" 
+                                            WHERE "{col_name}" IS NOT NULL 
+                                            AND "{col_name}" <> '' 
+                                            AND TRY_CAST("{col_name}" AS DATE) IS NULL
+                                        ''')
+                                    else:  # TIMESTAMP
+                                        self.conn.execute(f'''
+                                            SELECT COUNT(*) FROM "{table_name}" 
+                                            WHERE "{col_name}" IS NOT NULL 
+                                            AND "{col_name}" <> '' 
+                                            AND TRY_CAST("{col_name}" AS TIMESTAMP) IS NULL
+                                        ''')
+                                    
+                                    invalid_count = self.conn.fetchone()[0]
+                                    
+                                    if invalid_count > 0:
+                                        logging.warning(f"列 '{col_name}' 包含 {invalid_count} 行无法转换为{original_duck_type}的数据，保留为TEXT类型")
+                                        continue
+                                    
                                     # 尝试转换为日期
                                     self.conn.execute(f'''
                                         ALTER TABLE "{table_name}"
@@ -1166,7 +1255,25 @@ class ExcelToDuckDB:
                 logging.error(f"优化表 '{table_name}' 时出错: {str(e)}")
 
     def _reservoir_sample(self, sheet_name, total_rows):
-        """使用蓄水池抽样算法从Excel获取样本数据"""
+        """
+        使用蓄水池抽样算法从Excel获取样本数据
+        
+        蓄水池抽样算法说明：
+        1. 蓄水池抽样是一种在不知道总体大小的情况下，从流式数据中随机抽取固定数量样本的算法
+        2. 算法保证每个元素被抽取的概率相等，无论数据量多大
+        3. 实现步骤：
+           - 先将前k个元素放入"蓄水池"
+           - 对于第i个元素(i>k)，以k/i的概率决定是否替换蓄水池中的随机元素
+           - 这样保证了每个元素最终被选中的概率都是k/n
+        4. 本实现中，为了避免一次性加载整个Excel，使用批处理方式读取数据
+        
+        参数：
+            sheet_name (str): 工作表名称
+            total_rows (int): 工作表总行数
+            
+        返回：
+            pandas.DataFrame: 随机抽取的样本数据
+        """
         sample_size = min(self.sample_size, total_rows)
         
         # 使用默认引擎
@@ -1174,16 +1281,14 @@ class ExcelToDuckDB:
 
         if total_rows <= sample_size:
             # 如果总行数小于样本大小，直接读取所有行
-            excel_params = {'sheet_name': sheet_name}
-            if excel_engine is not None:
-                excel_params['engine'] = excel_engine
+            excel_params = self._build_excel_params(sheet_name, excel_engine)
             return pd.read_excel(self.excel_path, **excel_params)
 
         # 蓄水池抽样 - 读取所有数据但只保留随机样本
         reservoir = []
 
         # 批量读取Excel文件
-        batch_size = 1000
+        batch_size = RESERVOIR_BATCH_SIZE
         batches = (total_rows + batch_size - 1) // batch_size
 
         for i in range(batches):
@@ -1197,26 +1302,26 @@ class ExcelToDuckDB:
 
             try:
                 # 构建参数字典，只在excel_engine不为None时添加engine参数
-                excel_params = {
-                    'sheet_name': sheet_name,
-                    'skiprows': range(1, start_row + 1) if start_row > 0 else None,
-                    'nrows': nrows
-                }
-                if excel_engine is not None:
-                    excel_params['engine'] = excel_engine
-                    
+                excel_params = self._build_excel_params(sheet_name, excel_engine, skiprows=range(1, start_row + 1) if start_row > 0 else None, nrows=nrows)
+                
                 batch = pd.read_excel(
-                    self.excel_path,
+                    self.excel_path, 
                     **excel_params
                 )
                 
                 # 处理此批次的每一行
                 for j in range(len(batch)):
+                    # 当前处理的是整个数据集中的第(start_row + j)行
+                    current_row_index = start_row + j
+                    
                     if len(reservoir) < sample_size:
+                        # 阶段1: 直接填充蓄水池直到达到样本大小
                         reservoir.append(batch.iloc[j])
                     else:
-                        # 以递减概率替换现有样本
-                        r = random.randint(0, start_row + j)
+                        # 阶段2: 以递减概率替换现有样本
+                        # 对于第i个元素，以k/i的概率决定是否替换蓄水池中的随机元素
+                        # 这里k是sample_size，i是current_row_index
+                        r = random.randint(0, current_row_index)
                         if r < sample_size:
                             reservoir[r] = batch.iloc[j]
             except Exception as e:
@@ -1226,7 +1331,26 @@ class ExcelToDuckDB:
         return pd.DataFrame(reservoir)
 
     def _compute_sample_hash(self, df):
-        """计算样本数据的哈希值，用于稍后的验证"""
+        """
+        计算样本数据的哈希值，用于稍后的验证
+        
+        函数说明：
+        1. 此函数用于生成数据样本的唯一标识符（哈希值）
+        2. 主要用途：
+           - 在导入前后验证数据的一致性
+           - 检测数据在处理过程中是否发生变化
+           - 作为数据完整性验证的一部分
+        3. 实现方法：
+           - 将DataFrame转换为CSV字符串格式
+           - 使用MD5算法计算字符串的哈希值
+           - 返回16进制格式的哈希字符串
+        
+        参数：
+            df (pandas.DataFrame): 要计算哈希值的数据样本
+            
+        返回：
+            str: 计算得到的MD5哈希值，或在计算失败时返回"hash_error"
+        """
         # 将DataFrame转换为字符串并计算哈希
         try:
             sample_str = df.to_csv(index=False)
@@ -1236,7 +1360,28 @@ class ExcelToDuckDB:
             return "hash_error"
 
     def _clean_column_name(self, column_name):
-        """清理列名，移除非法字符并确保名称符合DuckDB要求"""
+        """
+        清理列名，移除非法字符并确保名称符合DuckDB要求
+        
+        函数说明：
+        1. 此函数用于处理Excel中的列名，使其符合DuckDB的命名规范
+        2. 主要清理操作包括：
+           - 将非字符串类型的列名转换为字符串
+           - 替换空格和连字符为下划线
+           - 移除所有非字母数字和下划线的字符
+           - 确保列名不以数字开头（DuckDB要求）
+           - 处理空列名的情况
+        3. 列名清理的重要性：
+           - 避免SQL语法错误
+           - 确保列名在数据库中的一致性
+           - 简化后续的数据查询和处理
+        
+        参数：
+            column_name: 原始列名，可以是任何类型
+            
+        返回：
+            str: 清理后的列名，符合DuckDB命名规范
+        """
         if not isinstance(column_name, str):
             column_name = str(column_name)
 
@@ -1256,8 +1401,136 @@ class ExcelToDuckDB:
 
         return clean_name
 
+    def _build_excel_params(self, sheet_name, excel_engine=None, **kwargs):
+        """
+        构建Excel参数字典，用于pandas读取Excel文件
+        
+        函数说明：
+        1. 此函数用于统一构建pandas读取Excel文件时所需的参数字典
+        2. 主要功能：
+           - 设置基本参数如工作表名称
+           - 根据需要添加引擎参数（如openpyxl、xlrd等）
+           - 处理其他可选参数（如行范围、列范围等）
+        3. 使用此函数的好处：
+           - 减少代码重复
+           - 确保参数设置的一致性
+           - 简化参数管理，特别是在多处需要读取Excel的情况下
+        
+        参数：
+            sheet_name (str): 工作表名称
+            excel_engine (str, optional): Excel引擎名称，如'openpyxl'或'xlrd'
+            **kwargs: 其他pandas.read_excel支持的参数，常用的包括：
+                      - skiprows: 跳过的行数或行索引列表
+                      - nrows: 读取的最大行数
+                      - usecols: 要读取的列索引或名称
+                      - header: 标题行的位置
+            
+        返回：
+            dict: 构建好的参数字典，可直接用于pandas.read_excel函数
+        """
+        # 创建基本参数字典
+        params = {'sheet_name': sheet_name}
+        
+        # 添加其他参数
+        for key, value in kwargs.items():
+            if value is not None:  # 只添加非None的参数
+                params[key] = value
+                
+        # 只在excel_engine不为None时添加engine参数
+        if excel_engine is not None:
+            params['engine'] = excel_engine
+            
+        return params
+        
+    def _validate_parameter(self, param_name, param_value, param_type, min_value=None, max_value=None, default_value=None):
+        """
+        验证参数的类型和范围，确保参数符合预期
+        
+        参数验证算法说明：
+        1. 参数验证的目标是确保用户提供的参数符合预期的类型和范围要求
+        2. 验证过程包括以下步骤：
+           - 检查参数是否为None，如果是则使用默认值
+           - 验证参数类型是否符合预期，如不符合则尝试转换
+           - 对于数值类型，验证是否在指定的最小值和最大值范围内
+           - 如果验证失败，记录警告并使用默认值
+        3. 验证结果：
+           - 如果验证成功，返回验证后的参数值
+           - 如果验证失败且有默认值，返回默认值
+           - 如果验证失败且无默认值，抛出ValueError异常
+        
+        参数：
+            param_name (str): 参数名称，用于日志记录
+            param_value: 要验证的参数值
+            param_type: 预期的参数类型（如int, str等）
+            min_value: 可选，参数的最小允许值
+            max_value: 可选，参数的最大允许值
+            default_value: 可选，如果验证失败时使用的默认值
+            
+        返回：
+            验证后的参数值或默认值
+            
+        异常：
+            ValueError: 如果验证失败且没有提供默认值
+        """
+        # 如果参数为None且有默认值，使用默认值
+        if param_value is None and default_value is not None:
+            logging.info(f"参数 '{param_name}' 为None，使用默认值: {default_value}")
+            return default_value
+            
+        # 验证参数类型
+        if not isinstance(param_value, param_type):
+            try:
+                # 尝试转换类型
+                param_value = param_type(param_value)
+                logging.info(f"参数 '{param_name}' 类型已从 {type(param_value).__name__} 转换为 {param_type.__name__}")
+            except (ValueError, TypeError) as e:
+                if default_value is not None:
+                    logging.warning(f"参数 '{param_name}' 类型错误，无法转换为 {param_type.__name__}，使用默认值 {default_value}: {str(e)}")
+                    return default_value
+                else:
+                    raise ValueError(f"参数 '{param_name}' 类型错误，应为 {param_type.__name__}: {str(e)}")
+        
+        # 验证数值范围（仅适用于数值类型）
+        if isinstance(param_value, (int, float)):
+            if min_value is not None and param_value < min_value:
+                if default_value is not None:
+                    logging.warning(f"参数 '{param_name}' 值 {param_value} 小于最小值 {min_value}，使用默认值 {default_value}")
+                    return default_value
+                else:
+                    raise ValueError(f"参数 '{param_name}' 值 {param_value} 小于最小值 {min_value}")
+                    
+            if max_value is not None and param_value > max_value:
+                if default_value is not None:
+                    logging.warning(f"参数 '{param_name}' 值 {param_value} 大于最大值 {max_value}，使用默认值 {default_value}")
+                    return default_value
+                else:
+                    raise ValueError(f"参数 '{param_name}' 值 {param_value} 大于最大值 {max_value}")
+        
+        return param_value
+
     def _map_dtype_to_duck(self, pandas_dtype, series):
-        """将pandas数据类型映射到DuckDB数据类型，并进行智能类型推断"""
+        """
+        将pandas数据类型映射到DuckDB数据类型，并进行智能类型推断
+        
+        类型映射算法说明：
+        1. 类型映射的目标是将pandas的数据类型转换为最合适的DuckDB数据类型
+        2. 映射过程遵循以下规则：
+           - 安全模式下，所有列都使用TEXT类型，避免类型转换错误
+           - 对于数值类型，区分INTEGER和BIGINT，根据数值范围选择合适类型
+           - 对于浮点类型，统一使用DOUBLE类型
+           - 对于日期时间类型，根据具体类型映射为DATE、TIMESTAMP或TIME
+           - 对于布尔类型，映射为BOOLEAN
+           - 对于对象和字符串类型，使用TEXT类型作为最安全的选择
+        3. 额外的安全检查：
+           - 对于数值类型，检查样本中是否含有非数值内容，如有则改用TEXT类型
+        
+        参数：
+            pandas_dtype (str): pandas数据类型字符串
+            series (pandas.Series): 列数据
+            
+        返回：
+            str: 映射后的DuckDB数据类型
+        """
         # 安全模式下，所有列使用TEXT类型
         if self.safe_mode:
             return 'TEXT'
@@ -1311,10 +1584,10 @@ class ExcelToDuckDB:
         """
         基于Excel结构创建DuckDB表
         
-        返回:
+        返回：
             bool: 创建是否成功
             
-        异常:
+        异常：
             不会抛出异常，而是返回False并记录错误
         """
         try:
