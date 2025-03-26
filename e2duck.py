@@ -8,6 +8,8 @@ import random
 from datetime import datetime
 import sys
 import traceback
+import multiprocessing
+import psutil  # 用于检测系统内存
 
 # 设置日志
 logging.basicConfig(
@@ -87,10 +89,29 @@ class ExcelToDuckDB:
             self.conn = duckdb.connect(self.db_path)
             logging.info(f"成功连接到数据库: {self.db_path}")
 
-            # 设置DuckDB并行处理线程数
-            self.conn.execute("PRAGMA threads=8")
-            # 设置内存限制 (4GB)
-            self.conn.execute("PRAGMA memory_limit='4GB'")
+            # 获取CPU核心数并设置合适的线程数
+            cpu_count = multiprocessing.cpu_count()
+            thread_count = min(cpu_count, 16)  # 避免过多线程导致上下文切换开销
+            self.conn.execute(f"PRAGMA threads={thread_count}")
+            logging.info(f"设置DuckDB并行处理线程数为{thread_count}")
+
+            # 根据机器内存大小调整内存限制
+            try:
+                total_memory = psutil.virtual_memory().total / (1024**3)  # 转换为GB
+                if total_memory >= 32:
+                    memory_limit = "16GB"  # 对于32GB及以上内存的机器
+                elif total_memory >= 16:
+                    memory_limit = "8GB"   # 对于16GB内存的机器
+                else:
+                    memory_limit = "4GB"   # 默认设置
+                
+                self.conn.execute(f"PRAGMA memory_limit='{memory_limit}'")
+                logging.info(f"根据系统内存({total_memory:.1f}GB)设置DuckDB内存限制为{memory_limit}")
+            except Exception as e:
+                # 如果内存检测失败，使用默认设置
+                self.conn.execute("PRAGMA memory_limit='4GB'")
+                logging.warning(f"内存检测失败，使用默认内存限制4GB: {str(e)}")
+                
             # 启用进度条
             self.conn.execute("PRAGMA enable_progress_bar=true")
             
@@ -335,66 +356,111 @@ class ExcelToDuckDB:
                         # 使用事务批量处理
                         self.conn.execute("BEGIN TRANSACTION")
 
-                        # 优化：使用批量插入替代逐行插入
+                        # 优化：首先尝试使用COPY语句导入数据（最高效）
+                        import tempfile
+                        import os
+                        
                         try:
-                            # 准备列名列表
-                            column_list = [f'"{col}"' for col in batch_df.columns]
+                            # 创建临时CSV文件
+                            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as temp_file:
+                                temp_csv = temp_file.name
                             
-                            # 处理数据值 - 将所有值转换为字符串或None
-                            # 创建一个新的DataFrame来存储处理后的数据
-                            processed_data = []
+                            # 将批次数据保存为CSV
+                            batch_df.to_csv(temp_csv, index=False)
                             
-                            # 批量处理行数据
-                            for _, row in batch_df.iterrows():
-                                row_values = []
-                                for val in row:
-                                    if pd.isna(val):
-                                        row_values.append(None)
-                                    else:
-                                        row_values.append(str(val))
-                                processed_data.append(row_values)
+                            try:
+                                # 使用COPY语句导入数据
+                                self.conn.execute(f"COPY \"{temp_table_name}\" FROM '{temp_csv}' (AUTO_DETECT TRUE)")
+                                
+                                # 导入成功后删除临时文件
+                                if os.path.exists(temp_csv):
+                                    os.remove(temp_csv)
+                                
+                                logging.info(f"批次 {i+1}/{num_batches}: 使用COPY语句成功导入数据")
+                                
+                            except Exception as copy_error:
+                                logging.error(f"使用COPY语句导入失败: {str(copy_error)}")
+                                logging.error(traceback.format_exc())
+                                
+                                # 删除临时文件
+                                if os.path.exists(temp_csv):
+                                    os.remove(temp_csv)
+                                
+                                # 回滚事务
+                                self.conn.execute("ROLLBACK")
+                                
+                                # 重新开始事务
+                                self.conn.execute("BEGIN TRANSACTION")
+                                
+                                # 回退到批量INSERT方式
+                                raise Exception("回退到批量INSERT方式")
+                                
+                        except Exception as csv_error:
+                            logging.error(f"创建临时CSV文件或使用COPY语句导入失败: {str(csv_error)}")
                             
-                            # 构建批量插入语句
-                            placeholders = ', '.join(['(' + ', '.join(['?' for _ in range(len(column_list))]) + ')'] * len(processed_data))
-                            insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES {placeholders}'
+                            # 回退到批量INSERT方式
+                            logging.info("尝试使用批量INSERT方式导入数据")
                             
-                            # 扁平化处理后的数据为一维列表
-                            flat_values = [val for row in processed_data for val in row]
-                            
-                            # 执行批量插入
-                            if flat_values:  # 确保有数据要插入
-                                self.conn.execute(insert_sql, flat_values)
-                            
-                        except Exception as bulk_error:
-                            logging.error(f"批量插入失败，尝试使用逐行插入作为备选方案: {str(bulk_error)}")
-                            logging.error(traceback.format_exc())
-                            
-                            # 回滚事务
-                            self.conn.execute("ROLLBACK")
-                            
-                            # 重新开始事务
-                            self.conn.execute("BEGIN TRANSACTION")
-                            
-                            # 备选方案：逐行插入
-                            logging.info("使用备选方案：逐行插入数据")
-                            for _, row in batch_df.iterrows():
-                                values = []
-                                placeholders = []
-                                column_list = []
+                            # 优化：使用批量插入替代逐行插入
+                            try:
+                                # 准备列名列表
+                                column_list = [f'"{col}"' for col in batch_df.columns]
+                                
+                                # 处理数据值 - 将所有值转换为字符串或None
+                                # 创建一个新的DataFrame来存储处理后的数据
+                                processed_data = []
+                                
+                                # 批量处理行数据
+                                for _, row in batch_df.iterrows():
+                                    row_values = []
+                                    for val in row:
+                                        if pd.isna(val):
+                                            row_values.append(None)
+                                        else:
+                                            row_values.append(str(val))
+                                    processed_data.append(row_values)
+                                
+                                # 构建批量插入语句
+                                placeholders = ', '.join(['(' + ', '.join(['?' for _ in range(len(column_list))]) + ')'] * len(processed_data))
+                                insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES {placeholders}'
+                                
+                                # 扁平化处理后的数据为一维列表
+                                flat_values = [val for row in processed_data for val in row]
+                                
+                                # 执行批量插入
+                                if flat_values:  # 确保有数据要插入
+                                    self.conn.execute(insert_sql, flat_values)
+                                
+                            except Exception as bulk_error:
+                                logging.error(f"批量插入失败，尝试使用逐行插入作为备选方案: {str(bulk_error)}")
+                                logging.error(traceback.format_exc())
+                                
+                                # 回滚事务
+                                self.conn.execute("ROLLBACK")
+                                
+                                # 重新开始事务
+                                self.conn.execute("BEGIN TRANSACTION")
+                                
+                                # 备选方案：逐行插入
+                                logging.info("使用备选方案：逐行插入数据")
+                                for _, row in batch_df.iterrows():
+                                    values = []
+                                    placeholders = []
+                                    column_list = []
 
-                                for col in batch_df.columns:
-                                    val = row[col]
-                                    # 确保所有值都转换为字符串
-                                    if pd.isna(val):
-                                        values.append(None)
-                                    else:
-                                        values.append(str(val))
-                                    placeholders.append('?')
-                                    column_list.append(f'"{col}"')
+                                    for col in batch_df.columns:
+                                        val = row[col]
+                                        # 确保所有值都转换为字符串
+                                        if pd.isna(val):
+                                            values.append(None)
+                                        else:
+                                            values.append(str(val))
+                                        placeholders.append('?')
+                                        column_list.append(f'"{col}"')
 
-                                # 执行插入
-                                insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES ({", ".join(placeholders)})'
-                                self.conn.execute(insert_sql, values)
+                                    # 执行插入
+                                    insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES ({", ".join(placeholders)})'
+                                    self.conn.execute(insert_sql, values)
 
                         # 提交事务
                         self.conn.execute("COMMIT")
@@ -745,63 +811,143 @@ class ExcelToDuckDB:
 
                     # 5. 统计信息验证 (仅当非安全模式时进行)
                     if not self.safe_mode:
+                        # 批量查询优化：构建所有统计查询并一次性执行
+                        validation_queries = []
+                        query_columns = []
+                        
                         for col_name, stats in info['column_stats'].items():
                             clean_col_name = self._clean_column_name(col_name)
-
+                            
                             if 'min' in stats and 'max' in stats:
                                 # 对数值列进行统计验证
-                                try:
-                                    self.conn.execute(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}") FROM "{table_name}"')
-                                    db_min, db_max, db_avg = self.conn.fetchone()
-
-                                    # 比较最小值、最大值和平均值
-                                    min_match = abs(stats['min'] - db_min) < 0.0001
-                                    max_match = abs(stats['max'] - db_max) < 0.0001
-                                    avg_match = abs(stats['mean'] - db_avg) < 0.0001
-
-                                    validation['stats_verification'].append({
-                                        'column': col_name,
-                                        'min_match': min_match,
-                                        'max_match': max_match,
-                                        'avg_match': avg_match,
-                                        'status': 'success' if (min_match and max_match and avg_match) else 'error'
-                                    })
-
-                                    if not (min_match and max_match and avg_match):
-                                        validation['messages'].append(
-                                            f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
-                                            f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
-                                        )
-
-                                except Exception as e:
-                                    validation['messages'].append(
-                                        f"验证列 '{col_name}' 统计信息时出错: {str(e)}"
-                                    )
-
+                                validation_queries.append(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}") FROM "{table_name}"')
+                                query_columns.append(('numeric', col_name, clean_col_name, stats))
                             elif 'unique_count' in stats:
                                 # 对分类列验证唯一值数量
-                                try:
-                                    self.conn.execute(f'SELECT COUNT(DISTINCT "{clean_col_name}") FROM "{table_name}"')
-                                    db_unique = self.conn.fetchone()[0]
-
-                                    # 比较唯一值数量 (允许一定误差)
-                                    unique_match = abs(stats['unique_count'] - db_unique) <= max(5, stats['unique_count'] * 0.05)
-
-                                    validation['stats_verification'].append({
-                                        'column': col_name,
-                                        'unique_count_match': unique_match,
-                                        'status': 'success' if unique_match else 'error'
-                                    })
-
-                                    if not unique_match:
+                                validation_queries.append(f'SELECT COUNT(DISTINCT "{clean_col_name}") FROM "{table_name}"')
+                                query_columns.append(('categorical', col_name, clean_col_name, stats))
+                        
+                        # 批量执行查询
+                        try:
+                            results = []
+                            for query in validation_queries:
+                                self.conn.execute(query)
+                                results.append(self.conn.fetchone())
+                            
+                            # 处理查询结果
+                            for i, (query_type, col_name, clean_col_name, stats) in enumerate(query_columns):
+                                if query_type == 'numeric':
+                                    try:
+                                        db_min, db_max, db_avg = results[i]
+                                        
+                                        # 比较最小值、最大值和平均值
+                                        min_match = abs(stats['min'] - db_min) < 0.0001
+                                        max_match = abs(stats['max'] - db_max) < 0.0001
+                                        avg_match = abs(stats['mean'] - db_avg) < 0.0001
+                                        
+                                        validation['stats_verification'].append({
+                                            'column': col_name,
+                                            'min_match': min_match,
+                                            'max_match': max_match,
+                                            'avg_match': avg_match,
+                                            'status': 'success' if (min_match and max_match and avg_match) else 'error'
+                                        })
+                                        
+                                        if not (min_match and max_match and avg_match):
+                                            validation['messages'].append(
+                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
+                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
+                                            )
+                                    except Exception as e:
                                         validation['messages'].append(
-                                            f"列 '{col_name}' 唯一值数量不匹配: Excel={stats['unique_count']}, DB={db_unique}"
+                                            f"处理列 '{col_name}' 数值统计结果时出错: {str(e)}"
                                         )
-
-                                except Exception as e:
-                                    validation['messages'].append(
-                                        f"验证列 '{col_name}' 唯一值时出错: {str(e)}"
-                                    )
+                                        
+                                elif query_type == 'categorical':
+                                    try:
+                                        db_unique = results[i][0]
+                                        
+                                        # 比较唯一值数量 (允许一定误差)
+                                        unique_match = abs(stats['unique_count'] - db_unique) <= max(5, stats['unique_count'] * 0.05)
+                                        
+                                        validation['stats_verification'].append({
+                                            'column': col_name,
+                                            'unique_count_match': unique_match,
+                                            'status': 'success' if unique_match else 'error'
+                                        })
+                                        
+                                        if not unique_match:
+                                            validation['messages'].append(
+                                                f"列 '{col_name}' 唯一值数量不匹配: Excel={stats['unique_count']}, DB={db_unique}"
+                                            )
+                                    except Exception as e:
+                                        validation['messages'].append(
+                                            f"处理列 '{col_name}' 分类统计结果时出错: {str(e)}"
+                                        )
+                        
+                        except Exception as batch_error:
+                            logging.error(f"批量执行统计查询时出错: {str(batch_error)}")
+                            logging.error(traceback.format_exc())
+                            
+                            # 回退到原有的逐个查询方式
+                            logging.warning("回退到逐个查询方式进行统计验证")
+                            for col_name, stats in info['column_stats'].items():
+                                clean_col_name = self._clean_column_name(col_name)
+                                
+                                if 'min' in stats and 'max' in stats:
+                                    # 对数值列进行统计验证
+                                    try:
+                                        self.conn.execute(f'SELECT MIN("{clean_col_name}"), MAX("{clean_col_name}"), AVG("{clean_col_name}") FROM "{table_name}"')
+                                        db_min, db_max, db_avg = self.conn.fetchone()
+                                        
+                                        # 比较最小值、最大值和平均值
+                                        min_match = abs(stats['min'] - db_min) < 0.0001
+                                        max_match = abs(stats['max'] - db_max) < 0.0001
+                                        avg_match = abs(stats['mean'] - db_avg) < 0.0001
+                                        
+                                        validation['stats_verification'].append({
+                                            'column': col_name,
+                                            'min_match': min_match,
+                                            'max_match': max_match,
+                                            'avg_match': avg_match,
+                                            'status': 'success' if (min_match and max_match and avg_match) else 'error'
+                                        })
+                                        
+                                        if not (min_match and max_match and avg_match):
+                                            validation['messages'].append(
+                                                f"列 '{col_name}' 统计信息不匹配: Excel(Min={stats['min']}, Max={stats['max']}, Avg={stats['mean']}), "
+                                                f"DB(Min={db_min}, Max={db_max}, Avg={db_avg})"
+                                            )
+                                            
+                                    except Exception as e:
+                                        validation['messages'].append(
+                                            f"验证列 '{col_name}' 统计信息时出错: {str(e)}"
+                                        )
+                                        
+                                elif 'unique_count' in stats:
+                                    # 对分类列验证唯一值数量
+                                    try:
+                                        self.conn.execute(f'SELECT COUNT(DISTINCT "{clean_col_name}") FROM "{table_name}"')
+                                        db_unique = self.conn.fetchone()[0]
+                                        
+                                        # 比较唯一值数量 (允许一定误差)
+                                        unique_match = abs(stats['unique_count'] - db_unique) <= max(5, stats['unique_count'] * 0.05)
+                                        
+                                        validation['stats_verification'].append({
+                                            'column': col_name,
+                                            'unique_count_match': unique_match,
+                                            'status': 'success' if unique_match else 'error'
+                                        })
+                                        
+                                        if not unique_match:
+                                            validation['messages'].append(
+                                                f"列 '{col_name}' 唯一值数量不匹配: Excel={stats['unique_count']}, DB={db_unique}"
+                                            )
+                                            
+                                    except Exception as e:
+                                        validation['messages'].append(
+                                            f"验证列 '{col_name}' 唯一值时出错: {str(e)}"
+                                        )
 
                 # 6. 综合判断验证状态
                 if db_count == 0:
