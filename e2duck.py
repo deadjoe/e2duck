@@ -10,6 +10,8 @@ import sys
 import traceback
 import multiprocessing
 import psutil  # 用于检测系统内存
+import concurrent.futures
+import threading
 
 # 设置日志
 logging.basicConfig(
@@ -144,35 +146,101 @@ class ExcelToDuckDB:
             start_time = time.time()
             logging.info(f"开始分析Excel文件: {self.excel_path}")
 
-            # 获取所有工作表
-            xl = pd.ExcelFile(self.excel_path)
+            # 尝试使用更高效的引擎，但保留回退选项
+            excel_engine = None
+            try:
+                # 尝试使用openpyxl引擎，通常更快
+                xl = pd.ExcelFile(self.excel_path, engine='openpyxl')
+                excel_engine = 'openpyxl'
+                logging.info("使用openpyxl引擎读取Excel")
+            except Exception as e:
+                # 如果失败，回退到默认引擎
+                logging.info(f"openpyxl引擎失败 ({str(e)})，使用默认引擎")
+                xl = pd.ExcelFile(self.excel_path)
+                excel_engine = 'default'
+                
             sheet_names = xl.sheet_names
             logging.info(f"Excel文件包含以下工作表: {sheet_names}")
 
             if not sheet_names:
                 logging.error("Excel文件不包含任何工作表")
                 return False
-
-            for sheet_name in sheet_names:
-                logging.info(f"分析工作表: {sheet_name}")
-
+                
+            # 创建线程锁以保护共享资源
+            samples_lock = threading.Lock()
+            
+            # 定义工作表处理函数
+            def process_sheet(sheet_name):
                 try:
-                    # 获取总行数 (预读取一次)
-                    df_info = pd.read_excel(self.excel_path, sheet_name=sheet_name, nrows=0)
-                    total_rows = len(pd.read_excel(self.excel_path, sheet_name=sheet_name))
-
-                    # 读取前1000行以推断数据类型和分析列
-                    df_sample = pd.read_excel(self.excel_path, sheet_name=sheet_name, nrows=1000)
+                    logging.info(f"分析工作表: {sheet_name}")
+                    
+                    # 获取行数 - 使用多种方法并验证
+                    total_rows = None
+                    
+                    # 方法1: 尝试使用openpyxl直接获取行数
+                    if excel_engine == 'openpyxl':
+                        try:
+                            sheet = xl.book[sheet_name]
+                            # 找到最后一个非空行
+                            max_row = sheet.max_row
+                            # 验证最后一行是否真的有数据
+                            has_header = True  # 假设有标题行
+                            for row in range(max_row, 0, -1):
+                                if any(sheet.cell(row=row, column=col).value is not None 
+                                      for col in range(1, sheet.max_column + 1)):
+                                    if has_header:
+                                        total_rows = row - 1  # 减去标题行
+                                    else:
+                                        total_rows = row
+                                    break
+                            logging.info(f"使用openpyxl获取工作表 '{sheet_name}' 行数: {total_rows}")
+                        except Exception as e:
+                            logging.warning(f"使用openpyxl获取行数失败: {str(e)}")
+                    
+                    # 方法2: 只读取第一列来获取行数
+                    if total_rows is None:
+                        try:
+                            df_count = pd.read_excel(
+                                self.excel_path, 
+                                sheet_name=sheet_name,
+                                usecols=[0],  # 只读取第一列
+                                header=0,
+                                engine=excel_engine
+                            )
+                            total_rows = len(df_count)
+                            logging.info(f"使用第一列获取工作表 '{sheet_name}' 行数: {total_rows}")
+                        except Exception as e:
+                            logging.warning(f"使用第一列获取行数失败: {str(e)}")
+                    
+                    # 方法3: 传统方法 - 如果前两种方法都失败
+                    if total_rows is None:
+                        df_count = pd.read_excel(
+                            self.excel_path, 
+                            sheet_name=sheet_name,
+                            engine=excel_engine
+                        )
+                        total_rows = len(df_count)
+                        logging.info(f"使用传统方法获取工作表 '{sheet_name}' 行数: {total_rows}")
+                    
+                    # 读取样本行进行分析 - 确保读取足够的行
+                    sample_size = min(1000, total_rows)
+                    df_sample = pd.read_excel(
+                        self.excel_path, 
+                        sheet_name=sheet_name, 
+                        nrows=sample_size,
+                        engine=excel_engine
+                    )
 
                     # 检查是否有列
                     if len(df_sample.columns) == 0:
                         logging.warning(f"工作表 '{sheet_name}' 不包含任何列，跳过")
-                        continue
+                        return None
 
                     # 获取列名和数据类型
                     columns_info = []
                     column_stats = {}
 
+                    # 处理列统计信息 - 保留关键统计信息
                     for col_name in df_sample.columns:
                         # 清理列名
                         clean_col_name = self._clean_column_name(col_name)
@@ -184,9 +252,10 @@ class ExcelToDuckDB:
 
                         logging.info(f"列 '{col_name}' 推断类型: {duck_type}")
 
-                        # 收集基本统计信息
+                        # 收集统计信息 - 确保关键统计信息完整
                         try:
-                            if pd.api.types.is_numeric_dtype(col_data) and not any(isinstance(x, str) for x in col_data.dropna()):
+                            if pd.api.types.is_numeric_dtype(col_data) and not any(isinstance(x, str) for x in col_data.dropna().head(100)):
+                                # 对数值列，保留完整统计信息
                                 stats = {
                                     'min': col_data.min(),
                                     'max': col_data.max(),
@@ -194,16 +263,15 @@ class ExcelToDuckDB:
                                     'null_count': col_data.isna().sum()
                                 }
                             else:
-                                # 对非数值列，计算唯一值数量和空值数量
+                                # 对非数值列，计算基本信息
                                 stats = {
                                     'unique_count': col_data.nunique(),
                                     'null_count': col_data.isna().sum()
                                 }
 
-                                # 对可能是枚举的列收集唯一值
-                                if col_data.nunique() < 50:  # 如果唯一值数量较少
-                                    unique_vals = col_data.dropna().unique().tolist()
-                                    # 只保存字符串形式 - 防止序列化问题
+                                # 对小型列收集唯一值，但保留验证所需的信息
+                                if col_data.nunique() < 30:  # 保留更多唯一值
+                                    unique_vals = col_data.dropna().unique().tolist()[:30]
                                     stats['unique_values'] = [str(val) for val in unique_vals]
 
                         except Exception as e:
@@ -220,30 +288,51 @@ class ExcelToDuckDB:
                             'has_nulls': col_data.isna().any()
                         })
 
-                    # 使用蓄水池抽样算法从Excel获取样本数据
-                    self.samples[sheet_name] = self._reservoir_sample(sheet_name, total_rows)
+                    # 使用蓄水池抽样 - 这是最安全的方法，确保随机性和代表性
+                    sample_df = self._reservoir_sample(sheet_name, total_rows)
                     
-                    # 检查样本是否为空
-                    if self.samples[sheet_name] is None or len(self.samples[sheet_name]) == 0:
+                    # 计算样本哈希
+                    if sample_df is None or len(sample_df) == 0:
                         logging.warning(f"工作表 '{sheet_name}' 样本为空，可能影响验证")
                         sample_hash = "empty_sample"
                     else:
-                        sample_hash = self._compute_sample_hash(self.samples[sheet_name])
+                        sample_hash = self._compute_sample_hash(sample_df)
+                    
+                    # 线程安全地更新样本
+                    with samples_lock:
+                        self.samples[sheet_name] = sample_df
 
-                    self.sheets_info[sheet_name] = {
+                    sheet_info = {
                         'columns': columns_info,
                         'column_stats': column_stats,
                         'row_count': total_rows,
                         'sample_hash': sample_hash
                     }
 
-                    logging.info(f"工作表 '{sheet_name}' 分析完成，包含 {len(columns_info)} 列，"
-                                f"{total_rows} 行")
+                    logging.info(f"工作表 '{sheet_name}' 分析完成，包含 {len(columns_info)} 列，{total_rows} 行")
+                    return (sheet_name, sheet_info)
 
                 except Exception as sheet_error:
                     logging.error(f"分析工作表 '{sheet_name}' 时出错: {str(sheet_error)}")
                     logging.error(traceback.format_exc())
-                    # 继续处理其他工作表
+                    return None
+
+            # 使用线程池并行处理工作表 - 限制线程数以避免资源争用
+            max_workers = min(len(sheet_names), os.cpu_count() or 4)
+            logging.info(f"使用 {max_workers} 个线程并行处理 {len(sheet_names)} 个工作表")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_sheet, sheet_name): sheet_name for sheet_name in sheet_names}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    sheet_name = futures[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            sheet_name, sheet_info = result
+                            self.sheets_info[sheet_name] = sheet_info
+                    except Exception as e:
+                        logging.error(f"处理工作表 '{sheet_name}' 结果时出错: {str(e)}")
 
             # 检查是否至少有一个工作表被成功分析
             if not self.sheets_info:
@@ -1076,7 +1165,7 @@ class ExcelToDuckDB:
 
             # 如果是最后一个批次，调整nrows
             if i == batches - 1:
-                nrows = total_rows - start_row
+                nrows = total_rows - (i * batch_size)
             else:
                 nrows = batch_size
 
