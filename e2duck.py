@@ -146,19 +146,16 @@ class ExcelToDuckDB:
             start_time = time.time()
             logging.info(f"开始分析Excel文件: {self.excel_path}")
 
-            # 尝试使用更高效的引擎，但保留回退选项
+            # 使用默认引擎读取Excel文件
             excel_engine = None
             try:
-                # 尝试使用openpyxl引擎，通常更快
-                xl = pd.ExcelFile(self.excel_path, engine='openpyxl')
-                excel_engine = 'openpyxl'
-                logging.info("使用openpyxl引擎读取Excel")
-            except Exception as e:
-                # 如果失败，回退到默认引擎
-                logging.info(f"openpyxl引擎失败 ({str(e)})，使用默认引擎")
+                # 直接使用默认引擎
                 xl = pd.ExcelFile(self.excel_path)
-                excel_engine = None
-                
+                logging.info("使用默认引擎读取Excel")
+            except Exception as e:
+                logging.error(f"读取Excel文件失败: {str(e)}")
+                return False
+
             sheet_names = xl.sheet_names
             logging.info(f"Excel文件包含以下工作表: {sheet_names}")
 
@@ -1172,15 +1169,8 @@ class ExcelToDuckDB:
         """使用蓄水池抽样算法从Excel获取样本数据"""
         sample_size = min(self.sample_size, total_rows)
         
-        # 确定使用的Excel引擎
+        # 使用默认引擎
         excel_engine = None
-        try:
-            # 尝试使用openpyxl引擎
-            pd.ExcelFile(self.excel_path, engine='openpyxl')
-            excel_engine = 'openpyxl'
-        except Exception:
-            # 如果失败，使用默认引擎
-            excel_engine = None
 
         if total_rows <= sample_size:
             # 如果总行数小于样本大小，直接读取所有行
