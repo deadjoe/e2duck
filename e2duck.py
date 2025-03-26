@@ -6,6 +6,8 @@ import time
 import hashlib
 import random
 from datetime import datetime
+import sys
+import traceback
 
 # 设置日志
 logging.basicConfig(
@@ -16,6 +18,51 @@ logging.basicConfig(
 
 class ExcelToDuckDB:
     def __init__(self, excel_path, db_path, sample_size=100, safe_mode=True):
+        """
+        初始化Excel到DuckDB转换器
+        
+        参数:
+            excel_path (str): Excel文件的路径
+            db_path (str): DuckDB数据库文件的路径
+            sample_size (int): 用于验证的样本大小，默认为100
+            safe_mode (bool): 是否使用安全模式（所有列使用TEXT类型），默认为True
+            
+        异常:
+            ValueError: 如果参数无效
+            TypeError: 如果参数类型错误
+        """
+        # 验证参数类型
+        if not isinstance(excel_path, str):
+            raise TypeError("excel_path必须是字符串类型")
+        if not isinstance(db_path, str):
+            raise TypeError("db_path必须是字符串类型")
+        if not isinstance(sample_size, int):
+            raise TypeError("sample_size必须是整数类型")
+        if not isinstance(safe_mode, bool):
+            raise TypeError("safe_mode必须是布尔类型")
+            
+        # 验证参数值
+        if not excel_path:
+            raise ValueError("excel_path不能为空")
+        if not db_path:
+            raise ValueError("db_path不能为空")
+        if sample_size <= 0:
+            raise ValueError("sample_size必须大于0")
+            
+        # 验证Excel文件路径
+        if not os.path.exists(excel_path):
+            raise FileNotFoundError(f"Excel文件不存在: {excel_path}")
+        
+        # 验证Excel文件扩展名
+        _, ext = os.path.splitext(excel_path)
+        if ext.lower() not in ['.xlsx', '.xls', '.xlsm']:
+            raise ValueError(f"不支持的Excel文件格式: {ext}。请使用.xlsx、.xls或.xlsm格式")
+            
+        # 验证数据库路径
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            raise ValueError(f"数据库目录不存在: {db_dir}")
+            
         self.excel_path = excel_path
         self.db_path = db_path
         self.conn = None
@@ -23,9 +70,18 @@ class ExcelToDuckDB:
         self.sample_size = sample_size
         self.samples = {}
         self.safe_mode = safe_mode  # 安全模式 - 默认开启
+        self.is_connected = False
 
     def connect_db(self):
-        """连接到DuckDB数据库"""
+        """
+        连接到DuckDB数据库
+        
+        返回:
+            bool: 连接是否成功
+            
+        异常:
+            不会抛出异常，而是返回False并记录错误
+        """
         try:
             # 尝试连接到现有数据库，如果不存在则创建
             self.conn = duckdb.connect(self.db_path)
@@ -37,18 +93,29 @@ class ExcelToDuckDB:
             self.conn.execute("PRAGMA memory_limit='4GB'")
             # 启用进度条
             self.conn.execute("PRAGMA enable_progress_bar=true")
+            
+            self.is_connected = True
+            return True
 
         except Exception as e:
             logging.error(f"连接数据库时出错: {str(e)}")
-            raise
+            logging.error(traceback.format_exc())
+            self.is_connected = False
+            return False
 
     def analyze_excel(self):
-        """分析Excel文件结构并提取样本数据用于验证"""
+        """
+        分析Excel文件结构并提取样本数据用于验证
+        
+        返回:
+            bool: 分析是否成功
+            
+        异常:
+            不会抛出异常，而是返回False并记录错误
+        """
         try:
-            # 检查文件是否存在
-            if not os.path.exists(self.excel_path):
-                raise FileNotFoundError(f"Excel文件不存在: {self.excel_path}")
-
+            # 文件检查已在__init__中完成，这里不再重复检查
+            
             # 检查文件大小
             file_size = os.path.getsize(self.excel_path) / (1024*1024)  # 转换为MB
             logging.info(f"Excel文件大小: {file_size:.2f} MB")
@@ -61,6 +128,10 @@ class ExcelToDuckDB:
             sheet_names = xl.sheet_names
             logging.info(f"Excel文件包含以下工作表: {sheet_names}")
 
+            if not sheet_names:
+                logging.error("Excel文件不包含任何工作表")
+                return False
+
             for sheet_name in sheet_names:
                 logging.info(f"分析工作表: {sheet_name}")
 
@@ -71,6 +142,11 @@ class ExcelToDuckDB:
 
                     # 读取前1000行以推断数据类型和分析列
                     df_sample = pd.read_excel(self.excel_path, sheet_name=sheet_name, nrows=1000)
+
+                    # 检查是否有列
+                    if len(df_sample.columns) == 0:
+                        logging.warning(f"工作表 '{sheet_name}' 不包含任何列，跳过")
+                        continue
 
                     # 获取列名和数据类型
                     columns_info = []
@@ -125,7 +201,13 @@ class ExcelToDuckDB:
 
                     # 使用蓄水池抽样算法从Excel获取样本数据
                     self.samples[sheet_name] = self._reservoir_sample(sheet_name, total_rows)
-                    sample_hash = self._compute_sample_hash(self.samples[sheet_name])
+                    
+                    # 检查样本是否为空
+                    if self.samples[sheet_name] is None or len(self.samples[sheet_name]) == 0:
+                        logging.warning(f"工作表 '{sheet_name}' 样本为空，可能影响验证")
+                        sample_hash = "empty_sample"
+                    else:
+                        sample_hash = self._compute_sample_hash(self.samples[sheet_name])
 
                     self.sheets_info[sheet_name] = {
                         'columns': columns_info,
@@ -139,189 +221,50 @@ class ExcelToDuckDB:
 
                 except Exception as sheet_error:
                     logging.error(f"分析工作表 '{sheet_name}' 时出错: {str(sheet_error)}")
+                    logging.error(traceback.format_exc())
                     # 继续处理其他工作表
+
+            # 检查是否至少有一个工作表被成功分析
+            if not self.sheets_info:
+                logging.error("所有工作表分析均失败")
+                return False
 
             elapsed_time = time.time() - start_time
             logging.info(f"Excel分析完成，耗时 {elapsed_time:.2f} 秒")
+            return True
 
         except Exception as e:
             logging.error(f"分析Excel文件时出错: {str(e)}")
-            raise
-
-    def _reservoir_sample(self, sheet_name, total_rows):
-        """使用蓄水池抽样算法从Excel获取样本数据"""
-        sample_size = min(self.sample_size, total_rows)
-
-        if total_rows <= sample_size:
-            # 如果总行数小于样本大小，直接读取所有行
-            return pd.read_excel(self.excel_path, sheet_name=sheet_name)
-
-        # 蓄水池抽样 - 读取所有数据但只保留随机样本
-        reservoir = []
-
-        # 批量读取Excel文件
-        batch_size = 1000
-        batches = (total_rows + batch_size - 1) // batch_size
-
-        for i in range(batches):
-            start_row = i * batch_size
-
-            # 如果是最后一个批次，调整nrows
-            if i == batches - 1:
-                nrows = total_rows - start_row
-            else:
-                nrows = batch_size
-
-            try:
-                batch = pd.read_excel(
-                    self.excel_path,
-                    sheet_name=sheet_name,
-                    skiprows=range(1, start_row + 1) if start_row > 0 else None,
-                    nrows=nrows
-                )
-
-                # 处理此批次的每一行
-                for j in range(len(batch)):
-                    if len(reservoir) < sample_size:
-                        reservoir.append(batch.iloc[j])
-                    else:
-                        # 以递减概率替换现有样本
-                        r = random.randint(0, start_row + j)
-                        if r < sample_size:
-                            reservoir[r] = batch.iloc[j]
-            except Exception as e:
-                logging.warning(f"从工作表 '{sheet_name}' 收集样本时批次 {i+1}/{batches} 出错: {str(e)}")
-                # 继续处理其他批次
-
-        return pd.DataFrame(reservoir)
-
-    def _compute_sample_hash(self, df):
-        """计算样本数据的哈希值，用于稍后的验证"""
-        # 将DataFrame转换为字符串并计算哈希
-        try:
-            sample_str = df.to_csv(index=False)
-            return hashlib.md5(sample_str.encode()).hexdigest()
-        except Exception as e:
-            logging.warning(f"计算样本哈希值时出错: {str(e)}")
-            return "hash_error"
-
-    def _clean_column_name(self, column_name):
-        """清理列名，移除非法字符并确保名称符合DuckDB要求"""
-        if not isinstance(column_name, str):
-            column_name = str(column_name)
-
-        # 替换空格和特殊字符
-        clean_name = column_name.replace(' ', '_').replace('-', '_')
-
-        # 移除其他非法字符
-        clean_name = ''.join(c for c in clean_name if c.isalnum() or c == '_')
-
-        # 确保不以数字开头
-        if clean_name and clean_name[0].isdigit():
-            clean_name = 'col_' + clean_name
-
-        # 避免列名为空
-        if not clean_name:
-            clean_name = 'column'
-
-        return clean_name
-
-    def _map_dtype_to_duck(self, pandas_dtype, series):
-        """将pandas数据类型映射到DuckDB数据类型，并进行智能类型推断"""
-        # 安全模式下，所有列使用TEXT类型
-        if self.safe_mode:
-            return 'TEXT'
-
-        # 检查是否有任何非数值字符串
-        if 'int' in pandas_dtype or 'float' in pandas_dtype:
-            # 额外检查 - 确保数值列中没有字符串值
-            try:
-                # 检查样本中是否含有非数值内容
-                sample = series.dropna().head(100)
-                for val in sample:
-                    if isinstance(val, str):
-                        logging.warning(f"列 {series.name} 数值类型中包含字符串值 '{val}'，改用TEXT类型")
-                        return 'TEXT'
-            except:
-                # 如果检查失败，使用更保守的TEXT类型
-                return 'TEXT'
-
-        # 处理常见数值类型
-        if 'int' in pandas_dtype:
-            if series.max() > 2147483647 or series.min() < -2147483648:
-                return 'BIGINT'
-            return 'INTEGER'
-
-        elif 'float' in pandas_dtype:
-            return 'DOUBLE'
-
-        # 处理日期和时间类型
-        elif 'datetime' in pandas_dtype:
-            return 'TIMESTAMP'
-
-        elif 'date' in pandas_dtype:
-            return 'DATE'
-
-        elif 'time' in pandas_dtype:
-            return 'TIME'
-
-        # 处理布尔类型
-        elif 'bool' in pandas_dtype:
-            return 'BOOLEAN'
-
-        # 处理字符串和对象类型 - 更保守的推断
-        elif 'object' in pandas_dtype or 'string' in pandas_dtype:
-            # 对于对象类型，全部使用TEXT类型，最安全
-            return 'TEXT'
-
-        # 默认类型
-        return 'TEXT'
-
-    def create_tables(self):
-        """基于Excel结构创建DuckDB表"""
-        try:
-            start_time = time.time()
-
-            for sheet_name, info in self.sheets_info.items():
-                # 创建表名 - 替换空格和特殊字符
-                table_name = sheet_name.replace(' ', '_').replace('-', '_')
-
-                # 创建临时表名用于导入和验证
-                temp_table_name = f"{table_name}_temp"
-
-                # 构建CREATE TABLE语句
-                columns_def = []
-                for col in info['columns']:
-                    # 如果启用安全模式，所有列都使用TEXT类型
-                    if self.safe_mode:
-                        data_type = 'TEXT'
-                    else:
-                        data_type = col["duck_type"]
-
-                    columns_def.append(f'"{col["clean_name"]}" {data_type}')
-
-                # 删除临时表（如果存在）
-                self.conn.execute(f'DROP TABLE IF EXISTS "{temp_table_name}"')
-
-                # 创建临时表
-                create_stmt = f'CREATE TABLE "{temp_table_name}" (\n'
-                create_stmt += ',\n'.join(columns_def)
-                create_stmt += '\n)'
-
-                logging.info(f"为工作表 '{sheet_name}' 创建临时表 '{temp_table_name}'，{'使用安全模式' if self.safe_mode else '使用推断类型'}")
-                logging.debug(create_stmt)
-
-                self.conn.execute(create_stmt)
-
-            elapsed_time = time.time() - start_time
-            logging.info(f"表结构创建完成，耗时 {elapsed_time:.2f} 秒")
-
-        except Exception as e:
-            logging.error(f"创建表时出错: {str(e)}")
-            raise
+            logging.error(traceback.format_exc())
+            return False
 
     def import_data(self, batch_size=5000):
-        """将数据从Excel导入到DuckDB，使用批处理以提高性能"""
+        """
+        将数据从Excel导入到DuckDB，使用批处理以提高性能
+        
+        参数:
+            batch_size (int): 每批处理的行数，默认为5000
+            
+        返回:
+            dict: 导入结果
+            
+        异常:
+            不会抛出异常，而是返回包含错误信息的结果
+        """
+        # 验证batch_size参数
+        if not isinstance(batch_size, int):
+            logging.error("batch_size必须是整数类型")
+            batch_size = 5000
+        
+        if batch_size <= 0:
+            logging.error("batch_size必须大于0，使用默认值5000")
+            batch_size = 5000
+        
+        # 如果batch_size过大，可能导致内存问题，设置上限
+        if batch_size > 50000:
+            logging.warning(f"batch_size ({batch_size}) 过大，可能导致内存问题，已调整为50000")
+            batch_size = 50000
+            
         all_results = {}
 
         for sheet_name, info in self.sheets_info.items():
@@ -476,6 +419,163 @@ class ExcelToDuckDB:
             }
 
         return all_results
+
+    def run(self):
+        """
+        执行完整的导入过程
+        
+        返回:
+            dict: 包含处理结果的字典
+        """
+        overall_start = time.time()
+        
+        # 用于存储各阶段结果
+        stage_results = {
+            'database_connection': False,
+            'excel_analysis': False,
+            'table_creation': False,
+            'data_import': None,
+            'data_validation': None,
+            'table_optimization': False
+        }
+
+        try:
+            logging.info(f"开始将Excel文件 '{self.excel_path}' 导入到DuckDB数据库 '{self.db_path}'，安全模式: {'开启' if self.safe_mode else '关闭'}")
+
+            print("步骤 1/5: 连接数据库...")
+            db_connection_success = self.connect_db()
+            stage_results['database_connection'] = db_connection_success
+            
+            if not db_connection_success:
+                return {
+                    'success': False,
+                    'error': "连接数据库失败",
+                    'stage_results': stage_results,
+                    'total_time': time.time() - overall_start
+                }
+
+            print("步骤 2/5: 分析Excel文件结构...")
+            excel_analysis_success = self.analyze_excel()
+            stage_results['excel_analysis'] = excel_analysis_success
+            
+            if not excel_analysis_success:
+                return {
+                    'success': False,
+                    'error': "分析Excel文件失败",
+                    'stage_results': stage_results,
+                    'total_time': time.time() - overall_start
+                }
+
+            print("步骤 3/5: 创建数据库表结构...")
+            try:
+                self.create_tables()
+                stage_results['table_creation'] = True
+            except Exception as e:
+                logging.error(f"创建表结构时出错: {str(e)}")
+                logging.error(traceback.format_exc())
+                return {
+                    'success': False,
+                    'error': f"创建表结构失败: {str(e)}",
+                    'stage_results': stage_results,
+                    'total_time': time.time() - overall_start
+                }
+
+            print("步骤 4/5: 导入数据...")
+            import_results = self.import_data()
+            stage_results['data_import'] = import_results
+
+            # 检查导入结果
+            successful_imports = [sheet for sheet, result in import_results.items()
+                                if result['import_success']]
+
+            if not successful_imports:
+                print("\n警告: 所有工作表导入均失败，跳过验证步骤")
+                logging.warning("所有工作表导入均失败，跳过验证步骤")
+                # 提前返回错误结果
+                return {
+                    'success': False,
+                    'error': "所有工作表导入失败",
+                    'stage_results': stage_results,
+                    'import_results': import_results,
+                    'total_time': time.time() - overall_start
+                }
+
+            print("步骤 5/5: 验证数据完整性...")
+            try:
+                validation_results = self.validate_import()
+                stage_results['data_validation'] = validation_results
+            except Exception as e:
+                logging.error(f"验证数据时出错: {str(e)}")
+                logging.error(traceback.format_exc())
+                validation_results = []
+                stage_results['data_validation'] = []
+                # 继续执行，因为数据可能已经导入成功
+
+            # 输出验证结果摘要
+            if validation_results:
+                print("\n数据导入验证结果:")
+                print("-" * 100)
+                print(f"{'工作表':<20} {'数据表':<20} {'Excel行数':<10} {'数据库行数':<10} {'状态':<10} {'消息'}")
+                print("-" * 100)
+
+                for result in validation_results:
+                    status_emoji = "✅" if result['overall_status'] == 'success' else "⚠️" if result['overall_status'] == 'warning' else "❌"
+                    msg = result['messages'][0] if result['messages'] else ""
+                    print(
+                        f"{result['sheet']:<20} {result['table']:<20} "
+                        f"{result['excel_rows']:<10} {result['db_rows']:<10} "
+                        f"{status_emoji} {result['overall_status']:<8} {msg}"
+                    )
+
+                    # 打印详细消息
+                    if len(result['messages']) > 1:
+                        for msg in result['messages'][1:]:
+                            print(f"{'':<60} - {msg}")
+
+            # 优化表
+            if validation_results and any(result['overall_status'] in ('success', 'warning') for result in validation_results):
+                print("\n至少有一个表格验证成功，正在优化表结构...")
+                try:
+                    self.optimize_tables()
+                    stage_results['table_optimization'] = True
+                except Exception as e:
+                    logging.error(f"优化表时出错: {str(e)}")
+                    logging.error(traceback.format_exc())
+                    # 继续执行，因为这只是优化步骤
+
+            overall_time = time.time() - overall_start
+            print(f"\n导入过程完成，总耗时: {overall_time:.2f} 秒")
+
+            logging.info(f"Excel到DuckDB导入过程完成，总耗时: {overall_time:.2f} 秒")
+
+            # 返回处理结果
+            return {
+                'success': validation_results and any(result['overall_status'] in ('success', 'warning') for result in validation_results),
+                'validation_results': validation_results,
+                'stage_results': stage_results,
+                'import_results': import_results,
+                'total_time': overall_time
+            }
+
+        except Exception as e:
+            logging.error(f"导入过程中出错: {str(e)}")
+            logging.error(traceback.format_exc())
+            print(f"错误: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'stage_results': stage_results,
+                'total_time': time.time() - overall_start
+            }
+
+        finally:
+            self.close()
+
+    def close(self):
+        """关闭数据库连接"""
+        if self.conn:
+            self.conn.close()
+            logging.info("数据库连接已关闭")
 
     def validate_import(self):
         """全面验证数据导入的正确性和完整性"""
@@ -767,98 +867,212 @@ class ExcelToDuckDB:
             except Exception as e:
                 logging.error(f"优化表 '{table_name}' 时出错: {str(e)}")
 
-    def close(self):
-        """关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
-            logging.info("数据库连接已关闭")
+    def _reservoir_sample(self, sheet_name, total_rows):
+        """使用蓄水池抽样算法从Excel获取样本数据"""
+        sample_size = min(self.sample_size, total_rows)
 
-    def run(self):
-        """执行完整的导入过程"""
-        overall_start = time.time()
+        if total_rows <= sample_size:
+            # 如果总行数小于样本大小，直接读取所有行
+            return pd.read_excel(self.excel_path, sheet_name=sheet_name)
 
-        try:
-            logging.info(f"开始将Excel文件 '{self.excel_path}' 导入到DuckDB数据库 '{self.db_path}'，安全模式: {'开启' if self.safe_mode else '关闭'}")
+        # 蓄水池抽样 - 读取所有数据但只保留随机样本
+        reservoir = []
 
-            print("步骤 1/5: 连接数据库...")
-            self.connect_db()
+        # 批量读取Excel文件
+        batch_size = 1000
+        batches = (total_rows + batch_size - 1) // batch_size
 
-            print("步骤 2/5: 分析Excel文件结构...")
-            self.analyze_excel()
+        for i in range(batches):
+            start_row = i * batch_size
 
-            print("步骤 3/5: 创建数据库表结构...")
-            self.create_tables()
+            # 如果是最后一个批次，调整nrows
+            if i == batches - 1:
+                nrows = total_rows - start_row
+            else:
+                nrows = batch_size
 
-            print("步骤 4/5: 导入数据...")
-            import_results = self.import_data()
-
-            # 检查导入结果
-            successful_imports = [sheet for sheet, result in import_results.items()
-                                if result['import_success']]
-
-            if not successful_imports:
-                print("\n警告: 所有工作表导入均失败，跳过验证步骤")
-                logging.warning("所有工作表导入均失败，跳过验证步骤")
-                # 提前返回错误结果
-                return {
-                    'success': False,
-                    'error': "所有工作表导入失败",
-                    'import_results': import_results,
-                    'total_time': time.time() - overall_start
-                }
-
-            print("步骤 5/5: 验证数据完整性...")
-            validation_results = self.validate_import()
-
-            # 输出验证结果摘要
-            print("\n数据导入验证结果:")
-            print("-" * 100)
-            print(f"{'工作表':<20} {'数据表':<20} {'Excel行数':<10} {'数据库行数':<10} {'状态':<10} {'消息'}")
-            print("-" * 100)
-
-            for result in validation_results:
-                status_emoji = "✅" if result['overall_status'] == 'success' else "⚠️" if result['overall_status'] == 'warning' else "❌"
-                msg = result['messages'][0] if result['messages'] else ""
-                print(
-                    f"{result['sheet']:<20} {result['table']:<20} "
-                    f"{result['excel_rows']:<10} {result['db_rows']:<10} "
-                    f"{status_emoji} {result['overall_status']:<8} {msg}"
+            try:
+                batch = pd.read_excel(
+                    self.excel_path,
+                    sheet_name=sheet_name,
+                    skiprows=range(1, start_row + 1) if start_row > 0 else None,
+                    nrows=nrows
                 )
 
-                # 打印详细消息
-                if len(result['messages']) > 1:
-                    for msg in result['messages'][1:]:
-                        print(f"{'':<60} - {msg}")
+                # 处理此批次的每一行
+                for j in range(len(batch)):
+                    if len(reservoir) < sample_size:
+                        reservoir.append(batch.iloc[j])
+                    else:
+                        # 以递减概率替换现有样本
+                        r = random.randint(0, start_row + j)
+                        if r < sample_size:
+                            reservoir[r] = batch.iloc[j]
+            except Exception as e:
+                logging.warning(f"从工作表 '{sheet_name}' 收集样本时批次 {i+1}/{batches} 出错: {str(e)}")
+                # 继续处理其他批次
 
-            # 优化表
-            if any(result['overall_status'] in ('success', 'warning') for result in validation_results):
-                print("\n至少有一个表格验证成功，正在优化表结构...")
-                self.optimize_tables()
+        return pd.DataFrame(reservoir)
 
-            overall_time = time.time() - overall_start
-            print(f"\n导入过程完成，总耗时: {overall_time:.2f} 秒")
+    def _compute_sample_hash(self, df):
+        """计算样本数据的哈希值，用于稍后的验证"""
+        # 将DataFrame转换为字符串并计算哈希
+        try:
+            sample_str = df.to_csv(index=False)
+            return hashlib.md5(sample_str.encode()).hexdigest()
+        except Exception as e:
+            logging.warning(f"计算样本哈希值时出错: {str(e)}")
+            return "hash_error"
 
-            logging.info(f"Excel到DuckDB导入过程完成，总耗时: {overall_time:.2f} 秒")
+    def _clean_column_name(self, column_name):
+        """清理列名，移除非法字符并确保名称符合DuckDB要求"""
+        if not isinstance(column_name, str):
+            column_name = str(column_name)
 
-            # 返回处理结果
-            return {
-                'success': any(result['overall_status'] in ('success', 'warning') for result in validation_results),
-                'validation_results': validation_results,
-                'total_time': overall_time
-            }
+        # 替换空格和特殊字符
+        clean_name = column_name.replace(' ', '_').replace('-', '_')
+
+        # 移除其他非法字符
+        clean_name = ''.join(c for c in clean_name if c.isalnum() or c == '_')
+
+        # 确保不以数字开头
+        if clean_name and clean_name[0].isdigit():
+            clean_name = 'col_' + clean_name
+
+        # 避免列名为空
+        if not clean_name:
+            clean_name = 'column'
+
+        return clean_name
+
+    def _map_dtype_to_duck(self, pandas_dtype, series):
+        """将pandas数据类型映射到DuckDB数据类型，并进行智能类型推断"""
+        # 安全模式下，所有列使用TEXT类型
+        if self.safe_mode:
+            return 'TEXT'
+
+        # 检查是否有任何非数值字符串
+        if 'int' in pandas_dtype or 'float' in pandas_dtype:
+            # 额外检查 - 确保数值列中没有字符串值
+            try:
+                # 检查样本中是否含有非数值内容
+                sample = series.dropna().head(100)
+                for val in sample:
+                    if isinstance(val, str):
+                        logging.warning(f"列 {series.name} 数值类型中包含字符串值 '{val}'，改用TEXT类型")
+                        return 'TEXT'
+            except:
+                # 如果检查失败，使用更保守的TEXT类型
+                return 'TEXT'
+
+        # 处理常见数值类型
+        if 'int' in pandas_dtype:
+            if series.max() > 2147483647 or series.min() < -2147483648:
+                return 'BIGINT'
+            return 'INTEGER'
+
+        elif 'float' in pandas_dtype:
+            return 'DOUBLE'
+
+        # 处理日期和时间类型
+        elif 'datetime' in pandas_dtype:
+            return 'TIMESTAMP'
+
+        elif 'date' in pandas_dtype:
+            return 'DATE'
+
+        elif 'time' in pandas_dtype:
+            return 'TIME'
+
+        # 处理布尔类型
+        elif 'bool' in pandas_dtype:
+            return 'BOOLEAN'
+
+        # 处理字符串和对象类型 - 更保守的推断
+        elif 'object' in pandas_dtype or 'string' in pandas_dtype:
+            # 对于对象类型，全部使用TEXT类型，最安全
+            return 'TEXT'
+
+        # 默认类型
+        return 'TEXT'
+
+    def create_tables(self):
+        """
+        基于Excel结构创建DuckDB表
+        
+        返回:
+            bool: 创建是否成功
+            
+        异常:
+            不会抛出异常，而是返回False并记录错误
+        """
+        try:
+            # 检查是否已连接到数据库
+            if not self.is_connected or self.conn is None:
+                logging.error("尝试创建表时数据库未连接")
+                return False
+                
+            # 检查是否有工作表信息
+            if not self.sheets_info:
+                logging.error("没有可用的工作表信息来创建表")
+                return False
+                
+            start_time = time.time()
+
+            for sheet_name, info in self.sheets_info.items():
+                # 检查列信息是否存在
+                if 'columns' not in info or not info['columns']:
+                    logging.warning(f"工作表 '{sheet_name}' 没有列信息，跳过创建表")
+                    continue
+                    
+                # 创建表名 - 替换空格和特殊字符
+                table_name = sheet_name.replace(' ', '_').replace('-', '_')
+
+                # 创建临时表名用于导入和验证
+                temp_table_name = f"{table_name}_temp"
+
+                # 构建CREATE TABLE语句
+                columns_def = []
+                for col in info['columns']:
+                    # 如果启用安全模式，所有列都使用TEXT类型
+                    if self.safe_mode:
+                        data_type = 'TEXT'
+                    else:
+                        data_type = col["duck_type"]
+
+                    columns_def.append(f'"{col["clean_name"]}" {data_type}')
+
+                # 检查是否有列定义
+                if not columns_def:
+                    logging.warning(f"工作表 '{sheet_name}' 没有有效的列定义，跳过创建表")
+                    continue
+
+                try:
+                    # 删除临时表（如果存在）
+                    self.conn.execute(f'DROP TABLE IF EXISTS "{temp_table_name}"')
+
+                    # 创建临时表
+                    create_stmt = f'CREATE TABLE "{temp_table_name}" (\n'
+                    create_stmt += ',\n'.join(columns_def)
+                    create_stmt += '\n)'
+
+                    logging.info(f"为工作表 '{sheet_name}' 创建临时表 '{temp_table_name}'，{'使用安全模式' if self.safe_mode else '使用推断类型'}")
+                    logging.debug(create_stmt)
+
+                    self.conn.execute(create_stmt)
+                except Exception as table_error:
+                    logging.error(f"创建表 '{temp_table_name}' 时出错: {str(table_error)}")
+                    logging.error(traceback.format_exc())
+                    # 继续处理其他表
+
+            elapsed_time = time.time() - start_time
+            logging.info(f"表结构创建完成，耗时 {elapsed_time:.2f} 秒")
+            return True
 
         except Exception as e:
-            logging.error(f"导入过程中出错: {str(e)}")
-            print(f"错误: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e),
-                'total_time': time.time() - overall_start
-            }
-
-        finally:
-            self.close()
-
+            logging.error(f"创建表时出错: {str(e)}")
+            logging.error(traceback.format_exc())
+            return False
 
 # 使用示例
 if __name__ == "__main__":
