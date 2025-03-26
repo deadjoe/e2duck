@@ -157,7 +157,7 @@ class ExcelToDuckDB:
                 # 如果失败，回退到默认引擎
                 logging.info(f"openpyxl引擎失败 ({str(e)})，使用默认引擎")
                 xl = pd.ExcelFile(self.excel_path)
-                excel_engine = 'default'
+                excel_engine = None
                 
             sheet_names = xl.sheet_names
             logging.info(f"Excel文件包含以下工作表: {sheet_names}")
@@ -200,12 +200,18 @@ class ExcelToDuckDB:
                     # 方法2: 只读取第一列来获取行数
                     if total_rows is None:
                         try:
+                            # 构建参数字典，只在excel_engine不为None时添加engine参数
+                            excel_params = {
+                                'sheet_name': sheet_name,
+                                'usecols': [0],  # 只读取第一列
+                                'header': 0
+                            }
+                            if excel_engine is not None:
+                                excel_params['engine'] = excel_engine
+                                
                             df_count = pd.read_excel(
                                 self.excel_path, 
-                                sheet_name=sheet_name,
-                                usecols=[0],  # 只读取第一列
-                                header=0,
-                                engine=excel_engine
+                                **excel_params
                             )
                             total_rows = len(df_count)
                             logging.info(f"使用第一列获取工作表 '{sheet_name}' 行数: {total_rows}")
@@ -214,21 +220,38 @@ class ExcelToDuckDB:
                     
                     # 方法3: 传统方法 - 如果前两种方法都失败
                     if total_rows is None:
-                        df_count = pd.read_excel(
-                            self.excel_path, 
-                            sheet_name=sheet_name,
-                            engine=excel_engine
-                        )
-                        total_rows = len(df_count)
-                        logging.info(f"使用传统方法获取工作表 '{sheet_name}' 行数: {total_rows}")
+                        try:
+                            # 构建参数字典，只在excel_engine不为None时添加engine参数
+                            excel_params = {
+                                'sheet_name': sheet_name
+                            }
+                            if excel_engine is not None:
+                                excel_params['engine'] = excel_engine
+                                
+                            df_count = pd.read_excel(
+                                self.excel_path, 
+                                **excel_params
+                            )
+                            total_rows = len(df_count)
+                            logging.info(f"使用传统方法获取工作表 '{sheet_name}' 行数: {total_rows}")
+                        except Exception as e:
+                            logging.error(f"获取工作表 '{sheet_name}' 行数失败: {str(e)}")
+                            return None
                     
                     # 读取样本行进行分析 - 确保读取足够的行
                     sample_size = min(1000, total_rows)
+                    
+                    # 构建参数字典，只在excel_engine不为None时添加engine参数
+                    excel_params = {
+                        'sheet_name': sheet_name,
+                        'nrows': sample_size
+                    }
+                    if excel_engine is not None:
+                        excel_params['engine'] = excel_engine
+                        
                     df_sample = pd.read_excel(
                         self.excel_path, 
-                        sheet_name=sheet_name, 
-                        nrows=sample_size,
-                        engine=excel_engine
+                        **excel_params
                     )
 
                     # 检查是否有列
@@ -1148,10 +1171,23 @@ class ExcelToDuckDB:
     def _reservoir_sample(self, sheet_name, total_rows):
         """使用蓄水池抽样算法从Excel获取样本数据"""
         sample_size = min(self.sample_size, total_rows)
+        
+        # 确定使用的Excel引擎
+        excel_engine = None
+        try:
+            # 尝试使用openpyxl引擎
+            pd.ExcelFile(self.excel_path, engine='openpyxl')
+            excel_engine = 'openpyxl'
+        except Exception:
+            # 如果失败，使用默认引擎
+            excel_engine = None
 
         if total_rows <= sample_size:
             # 如果总行数小于样本大小，直接读取所有行
-            return pd.read_excel(self.excel_path, sheet_name=sheet_name)
+            excel_params = {'sheet_name': sheet_name}
+            if excel_engine is not None:
+                excel_params['engine'] = excel_engine
+            return pd.read_excel(self.excel_path, **excel_params)
 
         # 蓄水池抽样 - 读取所有数据但只保留随机样本
         reservoir = []
@@ -1170,13 +1206,20 @@ class ExcelToDuckDB:
                 nrows = batch_size
 
             try:
+                # 构建参数字典，只在excel_engine不为None时添加engine参数
+                excel_params = {
+                    'sheet_name': sheet_name,
+                    'skiprows': range(1, start_row + 1) if start_row > 0 else None,
+                    'nrows': nrows
+                }
+                if excel_engine is not None:
+                    excel_params['engine'] = excel_engine
+                    
                 batch = pd.read_excel(
                     self.excel_path,
-                    sheet_name=sheet_name,
-                    skiprows=range(1, start_row + 1) if start_row > 0 else None,
-                    nrows=nrows
+                    **excel_params
                 )
-
+                
                 # 处理此批次的每一行
                 for j in range(len(batch)):
                     if len(reservoir) < sample_size:
