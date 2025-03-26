@@ -260,10 +260,12 @@ class ExcelToDuckDB:
             logging.error("batch_size必须大于0，使用默认值5000")
             batch_size = 5000
         
-        # 如果batch_size过大，可能导致内存问题，设置上限
-        if batch_size > 50000:
-            logging.warning(f"batch_size ({batch_size}) 过大，可能导致内存问题，已调整为50000")
-            batch_size = 50000
+        # 对于16GB-64GB内存的机器，可以使用更大的批处理大小
+        # 但仍然设置一个上限以防止内存问题
+        max_batch_size = 100000  # 增加到10万行
+        if batch_size > max_batch_size:
+            logging.warning(f"batch_size ({batch_size}) 过大，可能导致内存问题，已调整为{max_batch_size}")
+            batch_size = max_batch_size
             
         all_results = {}
 
@@ -333,26 +335,66 @@ class ExcelToDuckDB:
                         # 使用事务批量处理
                         self.conn.execute("BEGIN TRANSACTION")
 
-                        # 逐行插入数据
-                        for _, row in batch_df.iterrows():
-                            # 构建INSERT语句，明确将所有值作为文本处理
-                            values = []
-                            placeholders = []
-                            column_list = []
+                        # 优化：使用批量插入替代逐行插入
+                        try:
+                            # 准备列名列表
+                            column_list = [f'"{col}"' for col in batch_df.columns]
+                            
+                            # 处理数据值 - 将所有值转换为字符串或None
+                            # 创建一个新的DataFrame来存储处理后的数据
+                            processed_data = []
+                            
+                            # 批量处理行数据
+                            for _, row in batch_df.iterrows():
+                                row_values = []
+                                for val in row:
+                                    if pd.isna(val):
+                                        row_values.append(None)
+                                    else:
+                                        row_values.append(str(val))
+                                processed_data.append(row_values)
+                            
+                            # 构建批量插入语句
+                            placeholders = ', '.join(['(' + ', '.join(['?' for _ in range(len(column_list))]) + ')'] * len(processed_data))
+                            insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES {placeholders}'
+                            
+                            # 扁平化处理后的数据为一维列表
+                            flat_values = [val for row in processed_data for val in row]
+                            
+                            # 执行批量插入
+                            if flat_values:  # 确保有数据要插入
+                                self.conn.execute(insert_sql, flat_values)
+                            
+                        except Exception as bulk_error:
+                            logging.error(f"批量插入失败，尝试使用逐行插入作为备选方案: {str(bulk_error)}")
+                            logging.error(traceback.format_exc())
+                            
+                            # 回滚事务
+                            self.conn.execute("ROLLBACK")
+                            
+                            # 重新开始事务
+                            self.conn.execute("BEGIN TRANSACTION")
+                            
+                            # 备选方案：逐行插入
+                            logging.info("使用备选方案：逐行插入数据")
+                            for _, row in batch_df.iterrows():
+                                values = []
+                                placeholders = []
+                                column_list = []
 
-                            for col in batch_df.columns:
-                                val = row[col]
-                                # 确保所有值都转换为字符串
-                                if pd.isna(val):
-                                    values.append(None)
-                                else:
-                                    values.append(str(val))
-                                placeholders.append('?')
-                                column_list.append(f'"{col}"')
+                                for col in batch_df.columns:
+                                    val = row[col]
+                                    # 确保所有值都转换为字符串
+                                    if pd.isna(val):
+                                        values.append(None)
+                                    else:
+                                        values.append(str(val))
+                                    placeholders.append('?')
+                                    column_list.append(f'"{col}"')
 
-                            # 执行插入
-                            insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES ({", ".join(placeholders)})'
-                            self.conn.execute(insert_sql, values)
+                                # 执行插入
+                                insert_sql = f'INSERT INTO "{temp_table_name}" ({", ".join(column_list)}) VALUES ({", ".join(placeholders)})'
+                                self.conn.execute(insert_sql, values)
 
                         # 提交事务
                         self.conn.execute("COMMIT")
@@ -370,6 +412,7 @@ class ExcelToDuckDB:
                         # 记录详细错误信息
                         logging.error(f"导入批次 {i+1}/{num_batches} 到表 '{temp_table_name}' 时出错: {str(batch_error)}")
                         logging.error(f"错误类型: {type(batch_error).__name__}")
+                        logging.error(traceback.format_exc())
 
                         # 尝试记录一些数据样本以帮助诊断
                         if 'batch_df' in locals():
