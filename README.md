@@ -18,6 +18,9 @@ A robust and efficient tool for converting Excel files to DuckDB databases with 
 - **Comprehensive Validation**: Verify data integrity after import
 - **Performance Optimization**: Automatically optimize tables with indexes
 - **Detailed Logging**: Track the entire process with comprehensive logs
+- **Parallel Processing**: Utilize multi-threading for faster Excel analysis
+- **Memory-Aware**: Dynamically adjust batch sizes based on available system memory
+- **Robust Error Handling**: Gracefully handle various error scenarios with fallback mechanisms
 
 ## Installation
 
@@ -61,7 +64,7 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 
 # Or install dependencies directly
-uv pip install pandas duckdb
+uv pip install pandas duckdb psutil
 ```
 
 ### Verifying Installation
@@ -70,7 +73,7 @@ To verify that everything is installed correctly:
 
 ```bash
 # Make sure you're in the virtual environment
-python -c "import pandas; import duckdb; print('Installation successful!')"
+python -c "import pandas; import duckdb; import psutil; print('Installation successful!')"
 ```
 
 ## Usage
@@ -102,17 +105,46 @@ result = converter.run()
 # Check the result
 if result['success']:
     print("Import successful!")
+    
+    # Access validation results
+    validation_results = result.get('validation_results', [])
+    for validation in validation_results:
+        print(f"Sheet '{validation['sheet_name']}': {validation['overall_status']}")
 else:
     print(f"Import failed: {result.get('error', 'Unknown error')}")
 ```
 
+## Advanced Usage
+
+### Dynamic Batch Size
+
+The tool automatically adjusts batch sizes based on available system memory:
+
+```python
+# Let the system determine optimal batch size based on memory
+result = converter.import_data()
+
+# Or specify a custom batch size
+result = converter.import_data(batch_size=10000)
+```
+
+### Parallel Sheet Processing
+
+For multi-sheet Excel files, sheets are processed in parallel:
+
+```python
+# Analysis phase uses parallel processing for multiple sheets
+sheets_info = converter.analyze_excel()
+```
+
 ## Workflow
 
-1. **Analysis**: Scan Excel structure and extract sample data
-2. **Table Creation**: Create DuckDB tables based on Excel structure
-3. **Data Import**: Transfer data using batch processing
-4. **Validation**: Verify data integrity and completeness
-5. **Optimization**: Add indexes and optimize table structure
+1. **Connection**: Establish connection to DuckDB with optimized settings
+2. **Analysis**: Scan Excel structure and extract sample data using parallel processing
+3. **Table Creation**: Create DuckDB tables based on Excel structure
+4. **Data Import**: Transfer data using memory-aware batch processing
+5. **Validation**: Verify data integrity and completeness
+6. **Optimization**: Add indexes and optimize table structure
 
 ## Configuration Options
 
@@ -122,21 +154,26 @@ else:
 | `db_path` | Path to the DuckDB database | Required |
 | `sample_size` | Number of rows to sample for validation | 100 |
 | `safe_mode` | Use TEXT type for all columns | True |
-| `batch_size` | Number of rows to process in each batch | 5000 |
+| `batch_size` | Number of rows to process in each batch | Dynamic based on memory |
 
 ## Performance Considerations
 
 - **Memory Usage**: The tool uses batch processing and reservoir sampling to minimize memory usage
+- **Dynamic Batch Sizing**: Automatically adjusts batch size based on available system memory
 - **Processing Speed**: Configurable batch size to balance between speed and memory usage
 - **Database Optimization**: Automatic index creation for frequently queried columns
-- **Parallel Processing**: DuckDB's parallel processing capabilities are enabled by default
+- **Parallel Processing**: Multi-threaded Excel analysis and DuckDB's parallel processing capabilities
+- **Excel Engine Selection**: Attempts to use the most efficient Excel engine for each file format
+- **File Format**: `.xlsx` files process faster than `.xls` files due to better engine support
 
 ## Error Handling
 
 The tool provides comprehensive error handling with:
-- Detailed error messages
-- Extensive logging
+
+- Detailed error messages with specific error types
+- Standardized logging with appropriate log levels
 - Transaction-based imports to prevent partial data imports
+- Multiple fallback mechanisms for data import (COPY, bulk INSERT, row-by-row INSERT)
 - Validation to ensure data integrity
 
 ## License
