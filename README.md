@@ -189,12 +189,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 3. Commit your changes (`git commit -m 'Add some amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
-
-## Language Versions
-
-This project is available in two language versions:
-
-- **English Version** (`e2duck.py`): The main version with all comments, logs, and documentation in English.
-- **Chinese Version** (`e2duck_cn.py`): Original version with comments, logs, and documentation in Chinese.
-
-Both versions have identical functionality and code structure, differing only in the language of comments and text messages. Developers can choose the version that best suits their language preference.
