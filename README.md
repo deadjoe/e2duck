@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
 
-A robust and efficient tool for converting Excel(.xls and .xlsx) files to DuckDB databases with comprehensive validation and optimization.
+A robust and efficient tool for importing Excel(.xls and .xlsx) data to DuckDB databases with comprehensive validation and optimization.
 
 ## Features
 
