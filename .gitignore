@@ -39,10 +39,22 @@ venv.bak/
 # DuckDB
 *.duckdb
 *.duckdb.wal
+duckdb.data
 
-# Excel temp files
+# Excel files
 ~$*.xlsx
 ~$*.xls
+*.xls
+*.xlsx
+source.xls
+
+# Test data
+tests/data/input/xls/
+tests/data/input/xlsx/
 
 # Logs
 *.log
+
+# Coverage
+.coverage
+htmlcov/

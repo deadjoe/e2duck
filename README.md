@@ -2,8 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/yourusername/e2duck/graphs/commit-activity)
 
 A robust and efficient tool for converting Excel files to DuckDB databases with comprehensive validation and optimization.
 
@@ -27,22 +25,7 @@ A robust and efficient tool for converting Excel files to DuckDB databases with 
 ### Prerequisites
 
 - Python 3.7 or higher
-- [uv](https://github.com/astral-sh/uv) - Fast Python package installer and resolver
-
-### Installing uv
-
-If you don't have uv installed, you can install it using:
-
-```bash
-# On macOS/Linux using curl
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# On Windows using PowerShell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Using pip
-pip install uv
-```
+- Required packages: pandas, duckdb, psutil
 
 ### Setting up the project
 
@@ -51,20 +34,18 @@ pip install uv
 git clone https://github.com/yourusername/e2duck.git
 cd e2duck
 
-# Create a virtual environment using uv
-uv venv
-
-# Activate the virtual environment
+# Create and activate a virtual environment (optional but recommended)
+python -m venv venv
 # On macOS/Linux:
-source .venv/bin/activate
+source venv/bin/activate
 # On Windows:
-.venv\Scripts\activate
+venv\Scripts\activate
 
-# Install dependencies using uv
-uv pip install -r requirements.txt
+# Install dependencies
+pip install -r requirements.txt
 
-# Or install dependencies directly
-uv pip install pandas duckdb psutil
+# For development (includes testing tools)
+pip install -r requirements-dev.txt
 ```
 
 ### Verifying Installation
@@ -72,7 +53,6 @@ uv pip install pandas duckdb psutil
 To verify that everything is installed correctly:
 
 ```bash
-# Make sure you're in the virtual environment
 python -c "import pandas; import duckdb; import psutil; print('Installation successful!')"
 ```
 
@@ -81,15 +61,17 @@ python -c "import pandas; import duckdb; import psutil; print('Installation succ
 ### Command Line Interface
 
 ```bash
-python e2duck.py
+python run.py path/to/excel_file.xlsx path/to/output.duckdb [options]
 ```
 
-Follow the interactive prompts to specify the Excel file path and DuckDB database path.
+Available options:
+- `--sample-size SIZE`: Number of rows to sample for validation (default: 100)
+- `--no-safe-mode`: Disable safe mode (default: enabled)
 
 ### As a Module
 
 ```python
-from e2duck import ExcelToDuckDB
+from e2duck.e2duck import ExcelToDuckDB
 
 # Initialize the converter
 converter = ExcelToDuckDB(
@@ -109,7 +91,7 @@ if result['success']:
     # Access validation results
     validation_results = result.get('validation_results', [])
     for validation in validation_results:
-        print(f"Sheet '{validation['sheet_name']}': {validation['overall_status']}")
+        print(f"Sheet '{validation['sheet']}': {validation['overall_status']}")
 else:
     print(f"Import failed: {result.get('error', 'Unknown error')}")
 ```
@@ -165,6 +147,24 @@ sheets_info = converter.analyze_excel()
 - **Parallel Processing**: Multi-threaded Excel analysis and DuckDB's parallel processing capabilities
 - **Excel Engine Selection**: Attempts to use the most efficient Excel engine for each file format
 - **File Format**: `.xlsx` files process faster than `.xls` files due to better engine support
+
+## Testing
+
+The project includes comprehensive test coverage (62%) to ensure functionality and reliability:
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test file
+pytest tests/test_initialization.py
+
+# Run tests with coverage report
+pytest --cov=e2duck tests/
+
+# Generate detailed HTML coverage report
+pytest --cov=e2duck --cov-report=html tests/
+```
 
 ## Error Handling
 
