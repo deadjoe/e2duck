@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo_e2duck.png" alt="E2Duck Logo" width="200">
+  <img src="logo_e2duck.png" alt="E2Duck Logo" width="800">
 </p>
 
 # E2Duck: Excel to DuckDB Converter
