@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo_e2duck.png" alt="E2Duck Logo" width="200">
+</p>
+
 # E2Duck: Excel to DuckDB Converter
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
