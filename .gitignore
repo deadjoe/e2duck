@@ -58,3 +58,7 @@ tests/data/input/xlsx/
 # Coverage
 .coverage
 htmlcov/
+
+# Personal development documents
+test_plan.md
+CLAUDE.md
