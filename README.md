@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="logo_e2duck.png" alt="E2Duck Logo" width="500">
+  <img src="logo_e2duck.png" alt="E2Duck Logo" width="300">
 </p>
 
-# e2duck: Excel to DuckDB Converter
+# e2duck: Excel to DuckDB Importer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/downloads/)
