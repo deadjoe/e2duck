@@ -32,6 +32,9 @@ A robust and efficient tool for converting Excel files to DuckDB databases with 
 If you don't have uv installed, you can install it using:
 
 ```bash
+# On macOS using Homebrew
+brew install uv
+
 # On macOS/Linux using curl
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
